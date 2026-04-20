@@ -38,8 +38,15 @@ from training.curriculum import CurriculumScheduler
 from training.losses import composite_loss_rdt
 from training.muon import Muon
 from utils.logging import (
+    expected_lr,
     finish_run,
+    log_act_profile,
+    log_decoded_sample,
+    log_depth_extrapolation,
     log_eval_metrics,
+    log_expert_norms,
+    log_synthetic_arithmetic,
+    log_token_id_histogram,
     log_training_step,
     setup_wandb,
 )
@@ -193,6 +200,79 @@ def _evaluate_perplexity(
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic helpers
+# ---------------------------------------------------------------------------
+
+
+def _set_attn_diagnostics(model, enabled: bool) -> None:
+    """Flip the attention-logit sampling flag on every attention module that
+    supports it. GQAttention carries a `diagnostics` attribute; when True the
+    forward pass computes an extra QK matmul under no_grad to report the
+    pre-softmax abs-max. Cost is one matmul per attention block per forward,
+    so we gate this to log-interval steps only."""
+    try:
+        for block in model.prelude:
+            if hasattr(block.attn, "diagnostics"):
+                block.attn.diagnostics = enabled
+        if hasattr(model.recurrent.block.attn, "diagnostics"):
+            model.recurrent.block.attn.diagnostics = enabled
+        for block in model.coda:
+            if hasattr(block.attn, "diagnostics"):
+                block.attn.diagnostics = enabled
+    except AttributeError:
+        pass
+
+
+def _evaluate_synthetic_arithmetic(
+    model,
+    tokenizer,
+    device: str,
+    depths=(2, 4, 8, 12),
+    loop_counts=(8, 12, 16),
+    n_per_depth: int = 20,
+) -> dict:
+    """
+    Run a small synthetic multi-hop arithmetic probe. Returns
+    {(depth, n_loops): exact_match_accuracy}. Expensive enough to throttle
+    (runs model.generate per prompt), so called at checkpoint cadence.
+    """
+    from data.synthetic import generate_arithmetic_chain
+
+    import re
+    def _extract_answer(text: str):
+        nums = re.findall(r"-?\d+", text)
+        return int(nums[-1]) if nums else None
+
+    was_training = model.training
+    model.eval()
+    results: dict = {}
+    try:
+        with torch.no_grad():
+            for d in depths:
+                prompts = []
+                answers = []
+                for i in range(n_per_depth):
+                    p, a = generate_arithmetic_chain(d, seed=d * 9973 + i, mask_answer=True)
+                    prompts.append(p)
+                    answers.append(a)
+                for nl in loop_counts:
+                    correct = 0
+                    for p, a in zip(prompts, answers):
+                        ids = torch.tensor(tokenizer.encode(p), dtype=torch.long,
+                                           device=device).unsqueeze(0)
+                        out = model.generate(ids, max_new_tokens=12, n_loops=nl,
+                                             temperature=1.0, top_k=0)
+                        gen = tokenizer.decode(out[0][ids.shape[-1]:].tolist())
+                        if _extract_answer(gen) == a:
+                            correct += 1
+                    results[(d, nl)] = correct / max(1, len(prompts))
+    finally:
+        if was_training:
+            model.train()
+    return results
+
+
+# ---------------------------------------------------------------------------
 # RDT training loop
 # ---------------------------------------------------------------------------
 
@@ -292,9 +372,16 @@ def train_rdt(
               f"Run `python -m data.prepare_data` first.")
         raise
 
+    # Structural invariants at training start. These must hold end-to-end;
+    # if any of them changes later, something is very wrong and we'd rather
+    # crash than keep training on a silently-corrupted model.
+    model.assert_weight_tying()
+    invariant_param_count = model.unique_param_count()
+
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nTraining RDT")
-    print(f"  Parameters:          {n_params/1e9:.3f}B")
+    print(f"  Unique params:       {invariant_param_count/1e9:.3f}B (tying-aware)")
+    print(f"  Total params raw:    {n_params/1e9:.3f}B (double-counts tied head)")
     print(f"  Vocab size:          {config.vocab_size:,}")
     print(f"  Total steps:         {total_steps:,} (optimizer updates)")
     print(f"  Warmup steps:        {warmup_steps:,}")
@@ -304,16 +391,34 @@ def train_rdt(
     print(f"  target tokens:       {total_steps*micro_batch*grad_accum*max_seq_len/1e9:.1f}B")
     print()
 
+    # Intervals for the deeper diagnostic surfaces. See HANDOFF §7.1.
+    expert_norm_interval = max(log_interval, 100)         # per-expert weight/momentum norms
+    decoded_sample_interval = max(log_interval * 50, 500) # human-readable sample
+    depth_eval_interval = max(eval_interval * 10, 5000)   # perplexity at 4/8/12/16 loops
+    arithmetic_eval_interval = checkpoint_interval         # synthetic K in {2,4,8,12}
+    # Spectral gate tightened from 1.0 to 0.999: a value approaching 1 is a
+    # red flag even if it hasn't crossed yet.
+    spectral_warn_threshold = 0.999
+
     model.train()
     step = start_step
+    last_input_ids_sample: Optional[torch.Tensor] = None  # for periodic decoding
     while step < total_steps:
         n_loops = curriculum.step(step)
         muon.zero_grad(set_to_none=True)
         adamw.zero_grad(set_to_none=True)
 
+        # Toggle attention-logit sampling on the attention blocks only on
+        # log-interval steps: this is the one diagnostic that costs a real
+        # bmm (SDPA fuses softmax with the matmul, so to see pre-softmax
+        # magnitudes we redo QK). Zero cost when the flag is off.
+        sample_attn_this_step = ((step + 1) % log_interval == 0)
+        _set_attn_diagnostics(model, sample_attn_this_step)
+
         loss_accum = 0.0
         last_loss_dict = {}
         last_ponder_cost: Optional[torch.Tensor] = None
+        first_input_ids: Optional[torch.Tensor] = None
         for _ in range(grad_accum):
             try:
                 input_ids, targets = next(train_iter)
@@ -323,6 +428,8 @@ def train_rdt(
             input_ids = input_ids.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
             tokens_seen += input_ids.numel()
+            if first_input_ids is None:
+                first_input_ids = input_ids
 
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits, ponder_cost = model(input_ids, n_loops=n_loops)
@@ -336,6 +443,7 @@ def train_rdt(
             last_ponder_cost = ponder_cost.detach()
 
         loss_accum /= grad_accum  # report the average
+        last_input_ids_sample = first_input_ids
 
         # Per-group grad norms (pre-clip) for diagnostic logging
         grad_norms = {name: _per_group_grad_norm(params) for name, params in groups.items()}
@@ -364,13 +472,27 @@ def train_rdt(
 
         step += 1
 
-        # Spectral-radius safety gate
+        # Spectral-radius gates: hard fail at 1.0, warn at 0.999. The hard gate
+        # would indicate a broken invariant (spectral radius is supposed to be
+        # < 1 by construction); the soft warn surfaces drift before it bites.
         with torch.no_grad():
             spectral = model.recurrent.injection.get_A().abs().max().item()
         if spectral >= 1.0:
             raise RuntimeError(
                 f"LTI stability violated: ρ(A)={spectral:.6f} at step {step}. "
                 f"This should be architecturally impossible."
+            )
+        if spectral >= spectral_warn_threshold and step % log_interval == 0:
+            print(f"  WARN: ρ(A)={spectral:.6f} ≥ {spectral_warn_threshold} at step {step}")
+
+        # Structural invariant: unique-param count must not change.
+        current_param_count = model.unique_param_count()
+        if current_param_count != invariant_param_count:
+            raise RuntimeError(
+                f"Invariant violated: unique_param_count went from "
+                f"{invariant_param_count:,} to {current_param_count:,} at step {step}. "
+                f"Most likely cause: torch.compile broke weight tying. "
+                f"Check head.weight vs embed.weight data_ptr."
             )
 
         loss_history.append(loss_accum)
@@ -384,6 +506,13 @@ def train_rdt(
                 "adamw_default": adamw.param_groups[0]["lr"],
                 "adamw_recurrent": adamw.param_groups[1]["lr"],
             }
+            # Closed-form expected LR per group: schedule desync detector.
+            exp_lrs = {
+                "muon_default": expected_lr(step, warmup_steps, total_steps, lr_muon),
+                "muon_recurrent": expected_lr(step, warmup_steps, total_steps, lr_muon * 0.5),
+                "adamw_default": expected_lr(step, warmup_steps, total_steps, lr_adamw),
+                "adamw_recurrent": expected_lr(step, warmup_steps, total_steps, lr_adamw * 0.5),
+            }
             print(
                 f"step {step:>6}/{total_steps} | "
                 f"loss {last_loss_dict['total']:.4f} | "
@@ -396,15 +525,57 @@ def train_rdt(
             log_training_step(
                 run, step, last_loss_dict, grad_norms, total_grad_norm, lrs,
                 n_loops, tokens_seen, spectral, model, ponder_cost=last_ponder_cost,
+                expected_lrs_per_group=exp_lrs,
+                invariant_param_count=invariant_param_count,
             )
 
+        # Per-expert weight-norm & Muon-momentum diagnostics: O(n_experts)
+        # tensor reductions, hence throttled.
+        if step % expert_norm_interval == 0:
+            log_expert_norms(run, step, model, muon_optim=muon)
+
+        # Decoded-sample dump + token-id histogram: data-integrity catch-all.
+        # A human spot-check every few hours would find corrupted shards that
+        # no aggregate scalar will.
+        if step % decoded_sample_interval == 0 and last_input_ids_sample is not None:
+            log_decoded_sample(run, step, last_input_ids_sample.cpu(), tokenizer)
+            log_token_id_histogram(run, step, last_input_ids_sample.cpu(), config.vocab_size)
+
+        # Validation perplexity at current loop count (every eval_interval).
         if step % eval_interval == 0:
             val_iter = iter(create_dataloader(data_dir, micro_batch, max_seq_len, split="val"))
             val_ppl = _evaluate_perplexity(model, val_iter, config.vocab_size, n_loops, device)
             log_eval_metrics(run, step, {f"perplexity_loop{n_loops}": val_ppl})
             print(f"  [eval] step {step} perplexity@loop{n_loops} = {val_ppl:.2f}")
 
+        # Depth-extrapolation probe at multiple loop counts: the RDT thesis
+        # lives or dies here. Run at a large cadence to amortize the cost.
+        if step % depth_eval_interval == 0:
+            depth_ppls = {}
+            for nl in (4, 8, 12, 16):
+                vi = iter(create_dataloader(data_dir, micro_batch, max_seq_len, split="val"))
+                depth_ppls[nl] = _evaluate_perplexity(model, vi, config.vocab_size, nl, device,
+                                                      num_batches=8)
+            log_depth_extrapolation(run, step, depth_ppls)
+            print(f"  [depth-eval] step {step} " +
+                  "  ".join(f"loop{k}={v:.2f}" for k, v in depth_ppls.items()))
+
+        # Synthetic multi-hop arithmetic: capability probe independent of
+        # data distribution. Detects phase-transition artifacts vs. genuine
+        # compositional generalization.
+        if step % arithmetic_eval_interval == 0:
+            try:
+                acc = _evaluate_synthetic_arithmetic(model, tokenizer, device, n_per_depth=20)
+                log_synthetic_arithmetic(run, step, acc)
+                print(f"  [arith] step {step} " +
+                      "  ".join(f"K{d}/L{nl}={a:.2f}" for (d, nl), a in acc.items()))
+            except Exception as e:
+                # Tokenizer may not support necessary methods during smoke tests;
+                # don't crash training on an eval-side issue.
+                print(f"  [arith] eval skipped: {e}")
+
         if step % checkpoint_interval == 0:
+            model.assert_weight_tying()  # structural invariant gate at every ckpt
             save_checkpoint(
                 model, [muon, adamw], [sched_muon, sched_adamw], curriculum,
                 step, n_loops, loss_history, tokens_seen, config,

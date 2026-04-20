@@ -497,25 +497,42 @@ Run ARC-Easy and HellaSwag via `lm-evaluation-harness`. Sanity check that the mo
 
 ### 7.1 Logging
 
-Use Weights & Biases (`wandb`). Log per optimizer step:
-- `train/loss` (composite)
-- `train/lm_loss`
-- `train/moe_aux_loss`
-- `train/moe_z_loss`
-- `train/act_ponder_cost`
-- `train/grad_norm/total`, `train/grad_norm/muon_default`, `train/grad_norm/muon_recurrent`, `train/grad_norm/adamw_default`, `train/grad_norm/adamw_recurrent` (per-group, pre-clip)
-- `train/lr/muon_default`, `train/lr/muon_recurrent`, `train/lr/adamw_default`, `train/lr/adamw_recurrent`
-- `train/n_loops` (current loop depth from curriculum)
-- `train/tokens_seen`
-- `train/spectral_radius_max` (max of LTI injection's A matrix — should always be < 1)
-- `train/moe_dead_expert_count` (experts receiving <0.1% of tokens in current batch)
-- `train/act_halt_mean` (average halt step across batch)
+Use Weights & Biases (`wandb`). Aggregate loss is a poor signal at this scale; every metric below exists to surface a specific "broken but looks working" failure mode that loss alone hides. Logging overhead is negligible (~30 scalars/step); losing a $200/55-hour run because of an unmonitored invariant is not.
 
-Log per eval (every 500 steps for perplexity, every 5000 for full suite):
-- `eval/perplexity_loopN` for each evaluated loop count
-- `eval/act_mean_halt_step`
-- `eval/expert_entropy`
-- `eval/dead_expert_count`
+**Per optimizer step (via `log_training_step`)**:
+- Core losses: `train/loss`, `train/lm_loss`, `train/moe_aux_loss`, `train/moe_z_loss`, `train/act_ponder_cost`
+- **Loss-term fraction of total**: `train/loss_frac/{lm,aux,z,ponder}`. Healthy: `lm_frac > 0.7`. Catches coefficient drift (regularizers taking over late-training).
+- Gradient norms: `train/grad_norm/total` plus `train/grad_norm/{muon,adamw}_{default,recurrent}` (per-group, pre-clip). Watch the ratio — if recurrent runs >3× default for extended windows, the LR split is under-correcting.
+- Learning rates: `train/lr/{muon,adamw}_{default,recurrent}` actual + `train/lr_expected/*` closed-form + `train/lr_diff/*`. Nonzero diff = scheduler desync (resume off-by-one).
+- Curriculum: `train/n_loops`, `train/tokens_seen`.
+- **Structural invariants**: `train/invariant/unique_param_count`. Constant in a healthy run; any change means weight tying broke or a parameter was re-registered.
+- Stability gates: `train/spectral_radius_max` (hard fail at 1.0, soft warn at 0.999).
+- **Numerical-health abs-maxes**:
+  - `train/router_logits_abs_max` — pre-softmax router logits. Warning above ~12; BF16 saturation imminent.
+  - `train/attn_logits_abs_max` — pre-softmax attention logits, sampled every `log_interval` via an opt-in diagnostic matmul.
+  - `train/hidden_state_abs_max_final` — hidden state after last recurrent loop.
+  - `train/hidden_state_abs_max_any_loop` — max across loop iterations. Divergence from `_final` means an interior loop is peaking.
+- MoE health: `train/moe_dead_expert_count` (below 0.1% threshold in the most recent forward's routing).
+- ACT: `train/act_halt_mean` plus `train/act/p_mean_loop{0..T-1}` — per-loop halting-probability means. Flat across loops = ACT didn't learn differential allocation.
+
+**Periodic diagnostics** (every `log_interval × 10` = ~100 steps by default):
+- `diag/expert_norms/{mean,std,max,min,max_min_ratio,hist}` — per-expert weight-norm distribution across the 192 routed experts. Rising dispersion is an early warning for Muon × MoE drift before dead-expert count spikes.
+- `diag/muon_mom/expert_{mean,max,std}` — Muon momentum-buffer norms on expert rows.
+
+**Every ~500 steps** (decoded-sample + token histogram):
+- `diag/decoded_sample` — wandb text table of 2 rows from the training batch, decoded. Human spot-check catches data corruption that no aggregate metric shows.
+- `diag/token_id_hist` — coarse token-id histogram. Uniform distribution = tokenizer corruption.
+
+**Every `eval_interval`** (validation perplexity at current loop count):
+- `eval/perplexity_loop{current}`
+
+**Every `eval_interval × 10`** (depth-extrapolation probe — the RDT-thesis test):
+- `eval/perplexity_loop{4,8,12,16}` — run the validation set at all four loop counts.
+- `eval/depth_extrapolation` — boolean: did loop=12 or 16 beat loop=8?
+
+**Every `checkpoint_interval`** (capability probe):
+- `eval/arith/K{2,4,8,12}_loops{8,12,16}` — exact-match accuracy on synthetic multi-hop arithmetic. Phase-transition artifact vs. real grokking detector.
+- `eval/halt_step_by_type/{punct,stopword,content,digit,code}` — halt distribution bucketed by token type (requires tokenizer annotation). Flat across buckets = ACT collapsed to a uniform depth regardless of input difficulty.
 
 ### 7.2 Checkpointing
 

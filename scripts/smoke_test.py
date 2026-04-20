@@ -23,6 +23,7 @@ import tempfile
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from open_mythos import MythosConfig, OpenMythos
@@ -356,6 +357,99 @@ def test_router_bias_update_mechanism():
     print(f"   accumulator reset after update  OK")
 
 
+def test_observability_surfaces():
+    """
+    Every observability surface documented in HANDOFF §7.1 must emit a
+    finite, non-NaN scalar after a forward. These are the signals we rely on
+    to distinguish a working run from a broken one that looks working;
+    if any of them goes silent, the run is flying blind.
+    """
+    print("\n[11] Observability surfaces emit finite scalars after a forward...")
+    from utils.logging import (
+        router_logits_abs_max, attn_logits_abs_max,
+        hidden_state_abs_max_final_loop, hidden_state_abs_max_max,
+        halt_prob_means_per_loop, mean_halt_step,
+        loss_term_fractions, expected_lr,
+    )
+    cfg = _tiny_config()
+    model = OpenMythos(cfg)
+    model.train()
+    # Turn on attention diagnostics (cost: one extra QK matmul per attn block).
+    for block in model.prelude:
+        block.attn.diagnostics = True
+    model.recurrent.block.attn.diagnostics = True
+    for block in model.coda:
+        block.attn.diagnostics = True
+
+    ids = torch.randint(0, cfg.vocab_size, (2, 16))
+    logits, ponder = model(ids, n_loops=3)
+
+    # Router logits abs-max
+    v = router_logits_abs_max(model)
+    assert math.isfinite(v) and v > 0, f"router_logits_abs_max = {v}"
+    # Attn logits abs-max (populated because diagnostics=True)
+    v = attn_logits_abs_max(model)
+    assert math.isfinite(v) and v > 0, f"attn_logits_abs_max = {v}"
+    # Hidden state abs-max (per loop, max over all loops)
+    v = hidden_state_abs_max_final_loop(model)
+    assert math.isfinite(v) and v > 0, f"hidden_state_abs_max_final_loop = {v}"
+    v = hidden_state_abs_max_max(model)
+    assert math.isfinite(v) and v > 0, f"hidden_state_abs_max_max = {v}"
+    # Per-loop halt prob means
+    hm = halt_prob_means_per_loop(model)
+    assert len(hm) == 3, f"halt_prob_means length {len(hm)}, expected 3"
+    assert all(math.isfinite(x) and 0 <= x <= 1 for x in hm), hm
+    # Ponder-derived mean halt step
+    assert math.isfinite(mean_halt_step(ponder))
+
+    # Loss fractions should sum to approximately 1 for the loss dict returned
+    # by composite_loss_rdt.
+    targets = ids.clone()
+    _, loss_dict = composite_loss_rdt(model, logits, ponder, targets, cfg.vocab_size)
+    fracs = loss_term_fractions(loss_dict, 0.01, 1e-3, 1e-3)
+    total_frac = sum(fracs.values())
+    assert abs(total_frac - 1.0) < 1e-5, f"loss fractions sum to {total_frac}, expected ~1"
+
+    # Expected-LR matches closed-form: at step 0 (pre-warmup), LR = 0.
+    # At step warmup, LR = peak.
+    assert expected_lr(0, warmup=10, total=100, peak_lr=0.02) == 0.0
+    assert abs(expected_lr(10, warmup=10, total=100, peak_lr=0.02) - 0.02) < 1e-12
+
+    print(f"   router_abs_max OK | attn_abs_max OK | hidden_abs_max OK")
+    print(f"   halt_prob_per_loop={[f'{x:.3f}' for x in hm]}")
+    print(f"   loss_fractions sum={total_frac:.6f}  expected_lr closed-form OK  OK")
+
+
+def test_structural_invariants():
+    print("\n[12] Structural invariants (weight tying + unique param count)...")
+    cfg = _tiny_config()
+    model = OpenMythos(cfg)
+
+    # Tying assertion should pass cleanly at init
+    model.assert_weight_tying()
+    count_a = model.unique_param_count()
+    assert count_a > 0
+
+    # Tying uses pointer equality; verify directly
+    assert model.head.weight.data_ptr() == model.embed.weight.data_ptr()
+
+    # Simulate the failure mode: detach head weight into an independent tensor.
+    broken = OpenMythos(cfg)
+    with torch.no_grad():
+        broken.head.weight = nn.Parameter(broken.head.weight.detach().clone())
+    try:
+        broken.assert_weight_tying()
+        raise RuntimeError("assert_weight_tying should have raised")
+    except RuntimeError as e:
+        assert "Weight tying broken" in str(e), e
+    # And unique_param_count should report a higher number now
+    count_b = broken.unique_param_count()
+    assert count_b > count_a, f"broken param count {count_b} should exceed healthy {count_a}"
+
+    print(f"   tying assert passes on healthy model | raises on broken")
+    print(f"   healthy unique_param_count={count_a:,}, broken={count_b:,}  OK")
+
+
 def test_checkpoint_roundtrip():
     print("\n[9] Checkpoint save/load round-trip preserves both optimizer states + RNG...")
     cfg = _tiny_config()
@@ -436,6 +530,8 @@ def main():
     test_loss_decreases_on_toy_task()
     test_curriculum_plateau_coverage()
     test_router_bias_update_mechanism()
+    test_observability_surfaces()
+    test_structural_invariants()
     test_checkpoint_roundtrip()
 
     print("\n" + "=" * 60)

@@ -27,6 +27,8 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the upstream README with the full h
 
 **Architectural additions to `open_mythos/main.py`**
 - **MoE aux + z-loss accumulators** with a `reset_loss_accumulators()` hook called at the top of every `OpenMythos.forward`. Previously `aux_loss` was overwritten every loop iteration, so T−1 loops worth of routing signal was discarded. Now the optimizer sees the mean across all loop iterations; Switch-T coefficient semantics preserved.
+- **Observability hooks** on MoEFFN, GQAttention, and RecurrentBlock — `last_router_logits_abs_max`, opt-in `last_attn_logits_abs_max` (gated by a `diagnostics` flag; one extra QK matmul per attention block when on, zero cost when off), `last_hidden_abs_maxes` per loop, `last_halt_prob_means` per loop. These drive the "broken but looks working" detector set in `utils/logging.py`.
+- **Structural invariant helpers** on `OpenMythos` — `assert_weight_tying()` (raises if `head.weight` and `embed.weight` ever stop sharing storage, which `torch.compile` can silently break) and `unique_param_count()` (tying-aware). Run at training start, logged every step, and re-asserted at every checkpoint.
 - **DeepSeek-V3 router-bias update** (on by default at `n_experts=192`). `MoEFFN._step_expert_counts` accumulates per-expert routing counts across all micro-batches and loop iterations in an optimizer step; the training harness nudges `router_bias` by `γ · sign(target_load − observed_load)` after `optimizer.step()` and resets. Hard load-balance force complementary to the soft aux loss; avoids dead-expert spiral during early training. γ=1e-3 default; toggleable via `cfg.router_bias_update`.
 - **ST-MoE z-loss** — `logsumexp(router_logits)² mean` with coefficient 1e-3. Keeps router logits bounded under bf16.
 - **QK-norm** (DeepSeek-V3 / Gemma-2 style) on both GQA and MLA. Bounds attention logits across the looped recurrent block where the same attention runs T times.
@@ -43,7 +45,7 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the upstream README with the full h
 **Utilities and eval**
 - `utils/count_params.py` — unique-tensor counting (previously double-counted the tied LM head). Auto-pulls tokenizer vocab size.
 - `utils/count_flops.py` — `find_matching_layers()` for the FLOP-matched dense baseline. Currently recommends **24 layers** for the configured RDT.
-- `utils/logging.py` — per-group grad norms + LRs, dead-expert count, halt-mean, spectral radius, wandb `resume='must'` support.
+- `utils/logging.py` — full observability surface (HANDOFF §7.1): per-group grad norms + LRs, expected-vs-actual LR diff, pre-softmax router/attention/hidden-state abs-maxes, per-loop ACT halt means, per-term loss fraction of total, structural-invariant unique param count, dead-expert count, spectral radius, periodic per-expert weight-norm & Muon-momentum distributions, decoded-sample text tables, token-id histograms, depth-extrapolation probes, synthetic multi-hop arithmetic probes, wandb `resume='must'` support.
 - `eval/expert_util.py` — hook-based expert counting via the `MoEFFN.last_topk_idx` cache (previously referenced a non-existent `router.expert_counts` attribute).
 - `eval/perplexity.py`, `eval/act_profile.py` — dropped the `model.train()` side effect that clobbered caller mode.
 - `eval/arithmetic.py` — masked-prompt evaluation; decode only generated tokens (avoids extracting answer from the echoed prompt).

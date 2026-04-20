@@ -207,6 +207,12 @@ class GQAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
         self.attn_drop = nn.Dropout(cfg.dropout)
+        # Observability: if True, the forward computes an explicit QK matmul
+        # under no_grad to report pre-softmax attention-logit abs-max. Kept off
+        # during normal training (SDPA fuses the matmul and saves memory); the
+        # training harness flips it on periodically for a single forward.
+        self.diagnostics: bool = False
+        self.last_attn_logits_abs_max: torch.Tensor = torch.tensor(0.0)
 
     def forward(
         self,
@@ -251,6 +257,16 @@ class GQAttention(nn.Module):
         q = q.transpose(1, 2)  # (B, H, T, head_dim)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+
+        # Observability sample (opt-in). SDPA fuses softmax with the matmul,
+        # so to see pre-softmax logits we redo the QK matmul under no_grad.
+        # Flag is flipped off per-call by the training harness; zero cost
+        # when disabled, single extra bmm when enabled.
+        if self.diagnostics:
+            with torch.no_grad():
+                scale = 1.0 / math.sqrt(q.size(-1))
+                attn_logits = torch.matmul(q.detach(), k.detach().transpose(-2, -1)) * scale
+                self.last_attn_logits_abs_max = attn_logits.abs().amax()
 
         if mask is not None:
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
@@ -508,6 +524,10 @@ class MoEFFN(nn.Module):
         self.last_topk_idx: Optional[torch.Tensor] = None
         self.aux_loss: torch.Tensor = torch.tensor(0.0)
         self.z_loss: torch.Tensor = torch.tensor(0.0)
+        # Observability: pre-softmax router-logit magnitude. High absolute
+        # values mean bf16 saturation is imminent; z-loss should be keeping
+        # this bounded. Healthy: stays under ~8. Warning: drifts above 12.
+        self.last_router_logits_abs_max: torch.Tensor = torch.tensor(0.0)
 
     def reset_loss_accumulators(self) -> None:
         """
@@ -564,6 +584,10 @@ class MoEFFN(nn.Module):
         self.z_loss = self._z_sum / denom
         # Cache most recent topk_idx for eval/utilization analysis.
         self.last_topk_idx = topk_idx.detach()
+        # Capture pre-softmax router logit magnitude for observability.
+        # Tracked outside autograd to avoid any graph retention concerns.
+        with torch.no_grad():
+            self.last_router_logits_abs_max = logits.detach().abs().amax()
 
         # Accumulate per-optimizer-step expert counts for the DeepSeek-V3
         # router-bias update. Counted every loop iteration and every
@@ -891,6 +915,15 @@ class RecurrentBlock(nn.Module):
         self.loop_dim = (
             cfg.dim // 8
         )  # fraction of channels receiving loop-index embedding
+        # Observability: hidden-state abs-max after each loop iteration.
+        # Populated under no_grad during forward; cleared at the start of each
+        # forward so it only reflects the most recent call. Rising magnitudes
+        # across loops signal residual blow-up despite the LTI decay.
+        self.last_hidden_abs_maxes: list = []
+        # Per-loop halting probability means (pre-threshold), for ACT-collapse
+        # diagnosis. Healthy: a spread across loops. Collapsed-early: all
+        # concentrated at step 0 or 1. Collapsed-late: all ≈ 0 until max.
+        self.last_halt_prob_means: list = []
 
     def forward(
         self,
@@ -927,6 +960,10 @@ class RecurrentBlock(nn.Module):
         cumulative_ponder = torch.zeros(B, T, device=h.device)
         h_out = torch.zeros_like(h)
 
+        # Reset observability accumulators for this forward
+        self.last_hidden_abs_maxes = []
+        self.last_halt_prob_means = []
+
         for t in range(n_loops):
             h_loop = loop_index_embedding(h, t, self.loop_dim)
             combined = self.norm(h_loop + e)
@@ -949,6 +986,11 @@ class RecurrentBlock(nn.Module):
             cumulative_p = cumulative_p + p * still_running.float()
             cumulative_ponder = cumulative_ponder + p * still_running.float()
             halted = halted | (cumulative_p >= self.cfg.act_threshold)
+
+            # Observability snapshots (no grad); one scalar per loop iteration.
+            with torch.no_grad():
+                self.last_hidden_abs_maxes.append(h.detach().abs().amax())
+                self.last_halt_prob_means.append(p.detach().mean())
 
             if halted.all():
                 break
@@ -1076,6 +1118,42 @@ class OpenMythos(nn.Module):
         with torch.no_grad():
             self.recurrent.injection.log_A.fill_(math.log(-math.log(0.9)))
             self.recurrent.injection.log_dt.zero_()
+
+    def assert_weight_tying(self) -> None:
+        """
+        Structural invariant: `self.head.weight` and `self.embed.weight` share
+        storage. Weight tying is set up in __init__ via attribute assignment,
+        but `torch.compile` and some state-dict shenanigans can silently break
+        this. Called at every checkpoint save; raises if violated.
+        """
+        if self.head.weight.data_ptr() != self.embed.weight.data_ptr():
+            raise RuntimeError(
+                "Weight tying broken: head.weight and embed.weight no longer "
+                "share storage. Likely cause: torch.compile cloned the tensor, "
+                "or a state_dict load replaced one without the other. "
+                f"head.weight ptr={self.head.weight.data_ptr()}, "
+                f"embed.weight ptr={self.embed.weight.data_ptr()}"
+            )
+
+    def unique_param_count(self) -> int:
+        """
+        Total parameter count with weight-tying deduplication.
+
+        Standard `sum(p.numel() for p in self.parameters())` double-counts
+        tied parameters. This method walks the parameter graph and counts
+        each unique tensor only once. Logged every step as a structural
+        invariant — if this number changes mid-training, something is very
+        wrong (weight tying broke, or a parameter was re-registered).
+        """
+        seen = set()
+        total = 0
+        for p in self.parameters():
+            pid = id(p)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            total += p.numel()
+        return total
 
     def muon_param_predicate(self, name: str, param: nn.Parameter) -> bool:
         """

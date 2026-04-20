@@ -270,6 +270,59 @@ def prepare_shards(
     print(f"  train: {train_writer.total_rows:,} rows, {train_writer.total_tokens:,} tokens")
     print(f"  val:   {val_writer.total_rows:,} rows, {val_writer.total_tokens:,} tokens")
 
+    # Sanity: train/val 16-gram overlap. A healthy dedup yields <0.1% overlap
+    # on a random sample; higher suggests the dedup cache dropped near-dups
+    # into opposite splits and your val perplexity will be optimistic.
+    overlap = _train_val_ngram_overlap(output_path, n=16, n_samples=512)
+    print(f"\n  train/val 16-gram overlap (sample n=512): {overlap*100:.3f}%")
+    if overlap > 0.01:
+        print(f"  WARN: overlap >1% — inspect dedup logic; val metrics will lie.")
+    elif overlap > 0.001:
+        print(f"  NOTE: overlap >0.1% — review dedup; boundary leakage possible.")
+
+
+def _train_val_ngram_overlap(output_path: "Path", n: int = 16, n_samples: int = 512) -> float:
+    """
+    Rough estimate of n-gram leakage between train and val splits.
+
+    Samples up to `n_samples` rows from each split, extracts all n-grams,
+    and reports the fraction of val n-grams that also appear in the train
+    sample. This is a leak-detection heuristic, not a guarantee of non-leak;
+    large n (16) with small sample sizes (hundreds) gives a high-specificity
+    signal: false positives are unlikely at natural language with vocab~200k.
+    """
+    import random
+
+    train_paths = sorted(output_path.glob("train_*.parquet"))
+    val_paths = sorted(output_path.glob("val_*.parquet"))
+    if not train_paths or not val_paths:
+        return 0.0
+
+    rng = random.Random(0)
+
+    def _collect_ngrams(paths, n_rows):
+        rows_read = 0
+        ngrams: set = set()
+        for p in paths:
+            if rows_read >= n_rows:
+                break
+            tbl = pq.read_table(p, columns=["tokens"])
+            for row in tbl.column("tokens"):
+                tokens = row.as_py()
+                for i in range(0, len(tokens) - n + 1, max(1, (len(tokens) // 64))):
+                    ngrams.add(tuple(tokens[i : i + n]))
+                rows_read += 1
+                if rows_read >= n_rows:
+                    break
+        return ngrams
+
+    train_ngrams = _collect_ngrams(train_paths, n_samples)
+    val_ngrams = _collect_ngrams(val_paths, n_samples)
+    if not val_ngrams:
+        return 0.0
+    shared = train_ngrams & val_ngrams
+    return len(shared) / len(val_ngrams)
+
 
 def main():
     ap = argparse.ArgumentParser(description="Prepare tokenized training shards")
