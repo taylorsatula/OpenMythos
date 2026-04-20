@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Composite loss for RDT training: LM + MoE aux + MoE z-loss + ACT ponder."""
 
-from typing import Tuple
+from typing import Mapping, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+
+DEFAULT_COEFFS: Mapping[str, float] = {
+    "moe_aux": 0.01,
+    "moe_z": 1e-3,
+    "act_ponder": 1e-3,
+}
 
 
 def compute_lm_loss(logits: torch.Tensor, targets: torch.Tensor, vocab_size: int) -> torch.Tensor:
@@ -30,14 +37,16 @@ def composite_loss_rdt(
     ponder_cost: torch.Tensor,
     targets: torch.Tensor,
     vocab_size: int,
-    moe_aux_coeff: float = 0.01,
-    moe_z_coeff: float = 1e-3,
-    act_ponder_coeff: float = 1e-3,
+    coeffs: Optional[Mapping[str, float]] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """
     Four-term composite loss:
 
-        total = lm + 0.01 * moe_aux + 1e-3 * moe_z + 1e-3 * act_ponder
+        total = lm + c_aux * moe_aux + c_z * moe_z + c_ponder * act_ponder
+
+    Coefficients flow from the single source of truth (admin/config.json
+    in the training harness). When `coeffs` is None, DEFAULT_COEFFS is used
+    — matches pre-admin-dashboard behavior.
 
     `moe_aux` and `moe_z` are read from the recurrent MoE's running-mean
     accumulators, which are reset at the start of every `OpenMythos.forward`
@@ -47,8 +56,13 @@ def composite_loss_rdt(
 
     Returns:
         (total_loss_tensor, loss_dict) where loss_dict contains scalar floats
-        for each component.
+        for each component plus the coefficients actually applied — so the
+        caller and logger share one coefficient source.
     """
+    c = dict(DEFAULT_COEFFS)
+    if coeffs is not None:
+        c.update(coeffs)
+
     lm_loss = compute_lm_loss(logits, targets, vocab_size)
 
     ffn = model.recurrent.block.ffn
@@ -59,9 +73,9 @@ def composite_loss_rdt(
 
     total = (
         lm_loss
-        + moe_aux_coeff * moe_aux
-        + moe_z_coeff * moe_z
-        + act_ponder_coeff * act_ponder_loss
+        + c["moe_aux"] * moe_aux
+        + c["moe_z"] * moe_z
+        + c["act_ponder"] * act_ponder_loss
     )
 
     loss_dict = {
@@ -70,5 +84,6 @@ def composite_loss_rdt(
         "moe_aux": moe_aux.detach().item() if isinstance(moe_aux, torch.Tensor) else float(moe_aux),
         "moe_z": moe_z.detach().item() if isinstance(moe_z, torch.Tensor) else float(moe_z),
         "act_ponder": act_ponder_loss.detach().item(),
+        "coeffs_applied": dict(c),
     }
     return total, loss_dict

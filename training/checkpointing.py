@@ -34,8 +34,14 @@ def save_checkpoint(
     wandb_run_id: Optional[str],
     checkpoint_dir: str,
     checkpoint_name: Optional[str] = None,
+    admin_state: Optional[dict] = None,
 ) -> Optional[str]:
-    """Save a full training checkpoint. Returns path, or None if not rank 0."""
+    """Save a full training checkpoint. Returns path, or None if not rank 0.
+
+    `admin_state` (optional) carries the administration-dashboard snapshot
+    from `AdminRuntime.snapshot_state()` so that LR multipliers, rolling
+    buffers, and the last-applied config hash survive a resume.
+    """
     is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
     if is_distributed and torch.distributed.get_rank() != 0:
         return None
@@ -56,6 +62,7 @@ def save_checkpoint(
         "tokens_seen": tokens_seen,
         "config": config,
         "wandb_run_id": wandb_run_id,
+        "admin_state": admin_state,
         "rng_state": {
             "torch": torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -121,6 +128,7 @@ def load_checkpoint(
         "tokens_seen": ckpt.get("tokens_seen", 0),
         "wandb_run_id": ckpt.get("wandb_run_id"),
         "config": ckpt.get("config"),
+        "admin_state": ckpt.get("admin_state"),
     }
     print(
         f"Checkpoint loaded: {path}\n"

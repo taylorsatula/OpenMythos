@@ -10,7 +10,10 @@ more expensive than 30 extra scalars per step. Log them.
 
 import math
 import os
-from typing import List, Mapping, Optional
+import shutil
+import statistics
+import time
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -129,30 +132,230 @@ def mean_halt_step(ponder_cost: Optional[torch.Tensor]) -> float:
     return float(ponder_cost.detach().float().mean().item())
 
 
-def loss_term_fractions(loss_dict: dict, moe_aux_coeff: float, moe_z_coeff: float,
-                       act_ponder_coeff: float) -> dict:
+def loss_term_fractions(loss_dict: dict, coeffs: Mapping[str, float]) -> dict:
     """
     Fraction of total loss contributed by each term. Catches coefficient drift:
     `lm/total` should stay >0.7 throughout; if it sinks toward 0.5, the
     regularizers have taken over and LM learning has stalled.
+
+    `coeffs` must be the same coefficients used by `composite_loss_rdt` at
+    this step (thread from admin/config.json). If `loss_dict` contains a
+    `coeffs_applied` key (populated by composite_loss_rdt), that is used
+    instead — the strongest guarantee that report matches reality.
     """
+    c = dict(coeffs)
+    if "coeffs_applied" in loss_dict and isinstance(loss_dict["coeffs_applied"], Mapping):
+        c.update(loss_dict["coeffs_applied"])
     total = max(float(loss_dict.get("total", 0.0)), 1e-8)
     return {
         "lm_frac": float(loss_dict.get("lm", 0.0)) / total,
-        "aux_frac": moe_aux_coeff * float(loss_dict.get("moe_aux", 0.0)) / total,
-        "z_frac": moe_z_coeff * float(loss_dict.get("moe_z", 0.0)) / total,
-        "ponder_frac": act_ponder_coeff * float(loss_dict.get("act_ponder", 0.0)) / total,
+        "aux_frac": c.get("moe_aux", 0.0) * float(loss_dict.get("moe_aux", 0.0)) / total,
+        "z_frac": c.get("moe_z", 0.0) * float(loss_dict.get("moe_z", 0.0)) / total,
+        "ponder_frac": c.get("act_ponder", 0.0) * float(loss_dict.get("act_ponder", 0.0)) / total,
     }
 
 
 def expected_lr(step: int, warmup: int, total: int, peak_lr: float, min_ratio: float = 0.1) -> float:
     """Closed-form LR at a given step. Compared to the actual optimizer LR
     every step; a nonzero diff means scheduler has desynced (typical cause:
-    resume-from-checkpoint off-by-one)."""
+    resume-from-checkpoint off-by-one). Caller multiplies by any admin
+    LR-multiplier before comparing — otherwise the desync detector screams
+    the moment a multiplier is set."""
     if step < warmup:
         return peak_lr * step / max(1, warmup)
     progress = (step - warmup) / max(1, total - warmup)
     return peak_lr * (min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+
+# ---------------------------------------------------------------------------
+# Administration-dashboard diagnostics (new, added for the admin harness)
+# ---------------------------------------------------------------------------
+
+
+def timing_metrics(step_time_s: float, tokens_this_step: int) -> Dict[str, float]:
+    """Step wall-time + throughput. Caller brackets only forward+backward+optimizer,
+    excluding diagnostics and eval, so this metric stays clean."""
+    thr = tokens_this_step / step_time_s if step_time_s > 0 else 0.0
+    return {
+        "step_time_s": float(step_time_s),
+        "throughput_tokens_per_sec": float(thr),
+    }
+
+
+def system_metrics(ckpt_dir: Optional[str] = None) -> Dict[str, float]:
+    """GPU memory and checkpoint-filesystem free space. Both are free to collect."""
+    out: Dict[str, float] = {}
+    if torch.cuda.is_available():
+        out["gpu_mem_peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
+        out["gpu_mem_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
+    else:
+        out["gpu_mem_peak_gb"] = 0.0
+        out["gpu_mem_reserved_gb"] = 0.0
+    if ckpt_dir:
+        try:
+            target = ckpt_dir if os.path.exists(ckpt_dir) else os.path.dirname(ckpt_dir) or "."
+            du = shutil.disk_usage(target)
+            out["disk_free_gb_ckpt"] = du.free / 1e9
+        except (FileNotFoundError, OSError):
+            out["disk_free_gb_ckpt"] = 0.0
+    return out
+
+
+def cost_metrics(run_start_wall: float, gpu_hourly_rate: float = 3.50) -> Dict[str, float]:
+    wall_hours = (time.time() - run_start_wall) / 3600.0
+    return {
+        "wall_hours": float(wall_hours),
+        "estimated_cost_usd": float(wall_hours * gpu_hourly_rate),
+    }
+
+
+def _match_any(name: str, patterns: Sequence[str]) -> bool:
+    return any(p in name for p in patterns)
+
+
+def per_layer_grad_norms(
+    named_params: Iterable[Tuple[str, torch.nn.Parameter]],
+    selectors: Optional[Mapping[str, Sequence[str]]] = None,
+    prelude_layers: int = 4,
+    coda_layers: int = 4,
+) -> Dict[str, float]:
+    """
+    Per-layer L2 grad norm for the most informative buckets:
+    first/last prelude block, recurrent-attn vs recurrent-ffn-router vs
+    recurrent-ffn-shared, first/last coda block. Catches a single broken
+    layer that the four-group global norm would hide.
+
+    Pass an explicit `selectors` mapping to override the default bucket set.
+    """
+    if selectors is None:
+        last_pre = prelude_layers - 1
+        last_coda = coda_layers - 1
+        selectors = {
+            "prelude_first": [f"prelude.0."],
+            "prelude_last": [f"prelude.{last_pre}."],
+            "recurrent_attn": ["recurrent.block.attn."],
+            "recurrent_ffn_router": ["recurrent.block.ffn.router"],
+            "recurrent_ffn_shared": ["recurrent.block.ffn.shared_experts"],
+            "recurrent_injection": ["recurrent.injection."],
+            "recurrent_act": ["recurrent.act."],
+            "coda_first": [f"coda.0."],
+            "coda_last": [f"coda.{last_coda}."],
+        }
+
+    # One tensor list per bucket, then a single vector-norm per bucket.
+    buckets: Dict[str, List[torch.Tensor]] = {k: [] for k in selectors}
+    for name, p in named_params:
+        if p.grad is None:
+            continue
+        for bucket, patterns in selectors.items():
+            if _match_any(name, patterns):
+                buckets[bucket].append(p.grad.detach())
+                break  # one bucket per param
+
+    out: Dict[str, float] = {}
+    for bucket, tensors in buckets.items():
+        if not tensors:
+            out[bucket] = 0.0
+            continue
+        norms = torch.stack([torch.linalg.vector_norm(t) for t in tensors])
+        out[bucket] = float(torch.linalg.vector_norm(norms).item())
+    return out
+
+
+def attn_entropy_mean(model) -> float:
+    """Mean over prelude + recurrent + coda blocks of per-block cached
+    attention-softmax entropy. Only populated when the `diagnostics` flag
+    is on (training harness toggles it every log_interval steps).
+    Low entropy (approaching 0) = attention collapsed onto a few tokens."""
+    vals = []
+    try:
+        for block in model.prelude:
+            if hasattr(block.attn, "last_attn_entropy"):
+                vals.append(_safe_scalar(block.attn.last_attn_entropy))
+        if hasattr(model.recurrent.block.attn, "last_attn_entropy"):
+            vals.append(_safe_scalar(model.recurrent.block.attn.last_attn_entropy))
+        for block in model.coda:
+            if hasattr(block.attn, "last_attn_entropy"):
+                vals.append(_safe_scalar(block.attn.last_attn_entropy))
+    except AttributeError:
+        pass
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def router_entropy(model) -> float:
+    """Softmax entropy of the routing distribution on the last recurrent-loop
+    forward. Cheap (already-materialized logits). Collapsing entropy → dead
+    routes even when the dead-expert count still reads zero."""
+    try:
+        return _safe_scalar(model.recurrent.block.ffn.last_router_entropy)
+    except AttributeError:
+        return 0.0
+
+
+def router_bias_l2(model) -> float:
+    """L2 norm of the DeepSeek-V3 load-balancing bias buffer. Non-zero and
+    drifting means the bias update is active; sudden jumps can indicate
+    a dying expert the update is trying to rescue."""
+    try:
+        return float(model.recurrent.block.ffn.router_bias.detach().norm().item())
+    except AttributeError:
+        return 0.0
+
+
+def microbatch_loss_cv(microbatch_losses: Sequence[float]) -> float:
+    """Coefficient of variation (std/mean) across the `grad_accum` microbatches'
+    per-microbatch total losses. A sudden jump reveals a stale or corrupt shard
+    even when the mean across microbatches is unchanged."""
+    clean = [x for x in microbatch_losses if x is not None and math.isfinite(x)]
+    if len(clean) < 2:
+        return 0.0
+    mean = sum(clean) / len(clean)
+    if abs(mean) < 1e-12:
+        return 0.0
+    std = statistics.pstdev(clean)
+    return float(std / mean)
+
+
+def run_generation_probe(
+    model,
+    tokenizer,
+    prompts: Sequence[str],
+    device: str,
+    n_loops: int = 8,
+    max_new_tokens: int = 32,
+    temperature: float = 1.0,
+    top_k: int = 50,
+) -> List[Dict[str, Any]]:
+    """Run a small fixed-prompt panel and return list of result dicts. Never
+    raises — on per-prompt failure we return an `error` field. Caller is
+    responsible for logging and for toggling model.train()/.eval()."""
+    was_training = model.training
+    model.eval()
+    results: List[Dict[str, Any]] = []
+    try:
+        with torch.no_grad():
+            for prompt in prompts:
+                t0 = time.perf_counter()
+                try:
+                    ids = torch.tensor(tokenizer.encode(prompt), dtype=torch.long,
+                                       device=device).unsqueeze(0)
+                    out = model.generate(ids, max_new_tokens=max_new_tokens,
+                                          n_loops=n_loops, temperature=temperature, top_k=top_k)
+                    text = tokenizer.decode(out[0][ids.shape[-1]:].tolist())
+                    results.append({
+                        "prompt": prompt, "output": text, "n_loops": n_loops,
+                        "temperature": temperature, "top_k": top_k,
+                        "latency_s": time.perf_counter() - t0,
+                    })
+                except Exception as e:  # noqa: BLE001 — never crash the run on an eval issue
+                    results.append({
+                        "prompt": prompt, "output": "", "error": f"{type(e).__name__}: {e}",
+                        "n_loops": n_loops, "latency_s": time.perf_counter() - t0,
+                    })
+    finally:
+        if was_training:
+            model.train()
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -174,37 +377,39 @@ def log_training_step(
     ponder_cost: Optional[torch.Tensor] = None,
     expected_lrs_per_group: Optional[Mapping[str, float]] = None,
     invariant_param_count: Optional[int] = None,
-    moe_aux_coeff: float = 0.01,
-    moe_z_coeff: float = 1e-3,
-    act_ponder_coeff: float = 1e-3,
-):
+    loss_coeffs: Optional[Mapping[str, float]] = None,
+    lr_mults: Optional[Mapping[str, float]] = None,
+    per_layer_grad_norms_dict: Optional[Mapping[str, float]] = None,
+    extra_metrics: Optional[Mapping[str, float]] = None,
+) -> Dict[str, Any]:
     """
-    Log per-optimizer-step training metrics to wandb.
+    Log per-optimizer-step training metrics to wandb. Returns the assembled
+    metrics dict so the caller can also tee it to a local JSONL event stream
+    (see `tools.mythos_admin_runtime.AdminRuntime.log_metric`).
 
     In addition to the basic loss/grad/LR trio, this emits a set of
-    "broken-but-looks-working" detectors documented in HANDOFF §7.1:
+    "broken-but-looks-working" detectors documented in HANDOFF §7.1, plus
+    the administration-dashboard surface (timing, per-layer grad norms,
+    microbatch variance, attention/routing entropy, router-bias drift):
 
       - Per-term loss fraction of total (coefficient-drift detector)
-      - Expected-LR vs actual-LR diff (scheduler desync detector)
+      - Expected-LR vs actual-LR diff (scheduler desync detector, with
+        admin LR multipliers factored in)
       - Pre-softmax router logit abs-max (bf16 saturation detector)
       - Final-loop and max-across-loops hidden state abs-max
         (LTI drift / residual blow-up detector)
       - Per-loop ACT halting probability means (ACT collapse detector)
       - Structural invariant: unique parameter count (weight-tying detector)
       - Spectral radius max (LTI stability detector, threshold 0.999)
+      - Per-layer grad norms, attn entropy, router entropy, router-bias L2
+      - Throughput, step time, GPU memory, disk free (via `extra_metrics`)
     """
-    if run is None:
-        return
-    try:
-        import wandb  # noqa: F401
-    except ImportError:
-        return
-
+    coeffs = loss_coeffs if loss_coeffs is not None else {"moe_aux": 0.01, "moe_z": 1e-3, "act_ponder": 1e-3}
     dead_count = count_dead_experts(model)
     halt_mean = mean_halt_step(ponder_cost)
-    fracs = loss_term_fractions(loss_dict, moe_aux_coeff, moe_z_coeff, act_ponder_coeff)
+    fracs = loss_term_fractions(loss_dict, coeffs)
 
-    metrics = {
+    metrics: Dict[str, Any] = {
         "train/loss": _safe_scalar(loss_dict.get("total", 0.0)),
         "train/lm_loss": _safe_scalar(loss_dict.get("lm", 0.0)),
         "train/moe_aux_loss": _safe_scalar(loss_dict.get("moe_aux", 0.0)),
@@ -222,16 +427,27 @@ def log_training_step(
         "train/act_halt_mean": halt_mean,
         # Numerical health
         "train/router_logits_abs_max": router_logits_abs_max(model),
+        "train/router_entropy": router_entropy(model),
+        "train/router_bias_l2": router_bias_l2(model),
         "train/attn_logits_abs_max": attn_logits_abs_max(model),
+        "train/attn_entropy_mean": attn_entropy_mean(model),
         "train/hidden_state_abs_max_final": hidden_state_abs_max_final_loop(model),
         "train/hidden_state_abs_max_any_loop": hidden_state_abs_max_max(model),
+        "train/loss_coeff/moe_aux": coeffs.get("moe_aux", 0.0),
+        "train/loss_coeff/moe_z": coeffs.get("moe_z", 0.0),
+        "train/loss_coeff/act_ponder": coeffs.get("act_ponder", 0.0),
     }
     for g, v in grad_norms_per_group.items():
         metrics[f"train/grad_norm/{g}"] = v
     for g, v in lrs_per_group.items():
         metrics[f"train/lr/{g}"] = v
+    if lr_mults is not None:
+        for g, v in lr_mults.items():
+            metrics[f"train/lr_mult/{g}"] = v
 
-    # Expected vs actual LR (closed-form comparison; divergence flags scheduler desync)
+    # Expected vs actual LR (closed-form comparison; divergence flags scheduler desync).
+    # Caller is responsible for factoring in lr_mults on the expected side — otherwise
+    # the desync detector screams the moment any multiplier leaves 1.0.
     if expected_lrs_per_group is not None:
         for g, v in expected_lrs_per_group.items():
             metrics[f"train/lr_expected/{g}"] = v
@@ -239,8 +455,8 @@ def log_training_step(
             if actual is not None:
                 metrics[f"train/lr_diff/{g}"] = actual - v
 
-    # Structural invariant: unique parameter count. This is constant in a
-    # healthy run; a delta means weight tying broke or a param was re-registered.
+    # Structural invariant: unique parameter count. Constant in a healthy run;
+    # a delta means weight tying broke or a param was re-registered.
     if invariant_param_count is not None:
         metrics["train/invariant/unique_param_count"] = invariant_param_count
 
@@ -249,7 +465,24 @@ def log_training_step(
     for i, v in enumerate(halt_means):
         metrics[f"train/act/p_mean_loop{i}"] = v
 
-    run.log(metrics, step=step)
+    if per_layer_grad_norms_dict is not None:
+        for layer, v in per_layer_grad_norms_dict.items():
+            metrics[f"train/grad_norm_layer/{layer}"] = v
+
+    if extra_metrics is not None:
+        for k, v in extra_metrics.items():
+            # Namespace: anything with a `/` is left untouched; otherwise prefix with train/.
+            key = k if "/" in k else f"train/{k}"
+            metrics[key] = v
+
+    if run is not None:
+        try:
+            import wandb  # noqa: F401
+            run.log(metrics, step=step)
+        except ImportError:
+            pass
+
+    return metrics
 
 
 # ---------------------------------------------------------------------------

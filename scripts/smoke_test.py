@@ -406,7 +406,7 @@ def test_observability_surfaces():
     # by composite_loss_rdt.
     targets = ids.clone()
     _, loss_dict = composite_loss_rdt(model, logits, ponder, targets, cfg.vocab_size)
-    fracs = loss_term_fractions(loss_dict, 0.01, 1e-3, 1e-3)
+    fracs = loss_term_fractions(loss_dict, {"moe_aux": 0.01, "moe_z": 1e-3, "act_ponder": 1e-3})
     total_frac = sum(fracs.values())
     assert abs(total_frac - 1.0) < 1e-5, f"loss fractions sum to {total_frac}, expected ~1"
 

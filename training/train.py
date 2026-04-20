@@ -19,7 +19,7 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -37,7 +37,9 @@ from training.checkpointing import (
 from training.curriculum import CurriculumScheduler
 from training.losses import composite_loss_rdt
 from training.muon import Muon
+from tools.mythos_admin_runtime import AdminRuntime
 from utils.logging import (
+    cost_metrics,
     expected_lr,
     finish_run,
     log_act_profile,
@@ -48,7 +50,12 @@ from utils.logging import (
     log_synthetic_arithmetic,
     log_token_id_histogram,
     log_training_step,
+    microbatch_loss_cv,
+    per_layer_grad_norms,
+    run_generation_probe,
     setup_wandb,
+    system_metrics,
+    timing_metrics,
 )
 
 
@@ -298,6 +305,7 @@ def train_rdt(
     resume_from: Optional[str] = None,
     device: str = "cuda",
     use_torch_compile: bool = True,
+    gpu_hourly_rate: float = 3.50,
 ):
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -331,6 +339,7 @@ def train_rdt(
     loss_history: list = []
     tokens_seen = 0
     wandb_resume_id: Optional[str] = None
+    resumed_admin_state: Optional[dict] = None
 
     if resume_from:
         meta = load_checkpoint(resume_from, model, [muon, adamw], [sched_muon, sched_adamw],
@@ -339,6 +348,25 @@ def train_rdt(
         loss_history = meta["loss_history"]
         tokens_seen = meta["tokens_seen"]
         wandb_resume_id = meta.get("wandb_run_id")
+        resumed_admin_state = meta.get("admin_state")
+
+    # 3. Admin runtime — owns control plane (config/commands/status/audit)
+    # and local event streams (metrics/incidents/generations). Must exist
+    # before the loop so commands can land from step 0.
+    run_start_wall = time.time()
+    admin = AdminRuntime(
+        output_path,
+        run_start_wall=run_start_wall,
+        gpu_hourly_rate=gpu_hourly_rate,
+        max_loop_iters=config.max_loop_iters,
+    )
+    admin.seed_config_if_missing({
+        "grad_clip": grad_clip,
+        "gpu_hourly_rate": gpu_hourly_rate,
+    })
+    admin.load_state(resumed_admin_state)
+    admin.register_sigterm()
+    fixed_prompts = admin.load_prompts()
 
     run = setup_wandb(
         project=wandb_project,
@@ -358,16 +386,22 @@ def train_rdt(
         },
         resume_id=wandb_resume_id,
     )
+    if run is not None:
+        try:
+            print(f"  wandb run URL: {run.get_url()}")
+        except Exception:
+            pass
 
-    # 3. Data
+    # 4. Data — request metadata for shard provenance.
     from data.dataloader import create_dataloader
 
     def _fresh_train_iter():
-        return iter(create_dataloader(data_dir, micro_batch, max_seq_len, split="train"))
+        return iter(create_dataloader(data_dir, micro_batch, max_seq_len,
+                                       split="train", return_meta=True))
 
     try:
         train_iter = _fresh_train_iter()
-    except FileNotFoundError as e:
+    except FileNotFoundError:
         print(f"ERROR: training data not found at {data_dir}. "
               f"Run `python -m data.prepare_data` first.")
         raise
@@ -389,6 +423,8 @@ def train_rdt(
     print(f"  grad_accum:          {grad_accum}")
     print(f"  tokens/step:         {micro_batch*grad_accum*max_seq_len:,}")
     print(f"  target tokens:       {total_steps*micro_batch*grad_accum*max_seq_len/1e9:.1f}B")
+    print(f"  admin dir:           {admin.admin_dir}")
+    print(f"  events dir:          {admin.events_dir}")
     print()
 
     # Intervals for the deeper diagnostic surfaces. See HANDOFF §7.1.
@@ -396,48 +432,116 @@ def train_rdt(
     decoded_sample_interval = max(log_interval * 50, 500) # human-readable sample
     depth_eval_interval = max(eval_interval * 10, 5000)   # perplexity at 4/8/12/16 loops
     arithmetic_eval_interval = checkpoint_interval         # synthetic K in {2,4,8,12}
-    # Spectral gate tightened from 1.0 to 0.999: a value approaching 1 is a
-    # red flag even if it hasn't crossed yet.
-    spectral_warn_threshold = 0.999
+
+    def _do_checkpoint(step_val: int, n_loops_val: int,
+                        name: Optional[str] = None) -> Optional[str]:
+        """Disk-gated checkpoint save. Rotates aggressively when low on space."""
+        if not admin.disk_ok_for_checkpoint(ckpt_dir):
+            admin.emit_incident(
+                "disk_low_ckpt_skipped", severity="CRIT", step=step_val,
+                value=admin.disk_free_gb(ckpt_dir),
+            )
+            rotate_checkpoints(str(ckpt_dir), keep_last_n=2)
+            return None
+        model.assert_weight_tying()
+        path = save_checkpoint(
+            model, [muon, adamw], [sched_muon, sched_adamw], curriculum,
+            step_val, n_loops_val, loss_history, tokens_seen, config,
+            run.id if run is not None else None,
+            checkpoint_dir=str(ckpt_dir),
+            checkpoint_name=name,
+            admin_state=admin.snapshot_state(),
+        )
+        rotate_checkpoints(str(ckpt_dir), keep_last_n=5)
+        return path
 
     model.train()
     step = start_step
+    n_loops = 1  # placeholder; overwritten first iteration
     last_input_ids_sample: Optional[torch.Tensor] = None  # for periodic decoding
     while step < total_steps:
-        n_loops = curriculum.step(step)
+        # --- Admin: read config + dispatch pending commands at top of step ---
+        cfg = admin.read_config(current_step=step)
+        admin.process_pending_commands(executor={}, current_step=step)
+
+        if admin.is_hard_stop():
+            print(f"HARD STOP requested at step {step}; exiting without checkpoint.")
+            finish_run(run)
+            return model, {"step": step, "tokens_seen": tokens_seen,
+                           "loss_history": loss_history}
+
+        # Pause branch: heartbeat stays alive, commands still processed, no step.
+        if cfg.pause_until_step is not None and step < cfg.pause_until_step:
+            sys_now = system_metrics(str(ckpt_dir))
+            cost_now = cost_metrics(run_start_wall, cfg.gpu_hourly_rate)
+            admin.write_status(
+                step=step, total_steps=total_steps, n_loops=n_loops,
+                loss={"total": 0.0}, paused=True,
+                pause_until_step=cfg.pause_until_step,
+                gpu_mem_peak_gb=sys_now.get("gpu_mem_peak_gb", 0.0),
+                disk_free_gb_ckpt=sys_now.get("disk_free_gb_ckpt", 0.0),
+                wall_hours=cost_now["wall_hours"],
+                estimated_cost_usd=cost_now["estimated_cost_usd"],
+                max_loop_iters=config.max_loop_iters,
+                config_applied_hash=admin.snapshot_state()["config_hash"],
+            )
+            time.sleep(1.0)
+            if admin.should_stop():
+                break
+            continue
+
+        n_loops = (cfg.n_loops_override
+                   if cfg.n_loops_override is not None else curriculum.step(step))
         muon.zero_grad(set_to_none=True)
         adamw.zero_grad(set_to_none=True)
 
         # Toggle attention-logit sampling on the attention blocks only on
-        # log-interval steps: this is the one diagnostic that costs a real
-        # bmm (SDPA fuses softmax with the matmul, so to see pre-softmax
-        # magnitudes we redo QK). Zero cost when the flag is off.
-        sample_attn_this_step = ((step + 1) % log_interval == 0)
+        # log-interval steps: SDPA fuses softmax with the matmul, so to see
+        # pre-softmax magnitudes and compute entropy we redo QK. Zero cost
+        # when the flag is off. Interval is admin-tunable.
+        attn_diag_interval = cfg.diagnostic_intervals.get("attn_entropy", log_interval)
+        sample_attn_this_step = ((step + 1) % attn_diag_interval == 0)
         _set_attn_diagnostics(model, sample_attn_this_step)
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
+        t_step_start = time.perf_counter()
         loss_accum = 0.0
-        last_loss_dict = {}
+        last_loss_dict: Dict[str, Any] = {}
         last_ponder_cost: Optional[torch.Tensor] = None
         first_input_ids: Optional[torch.Tensor] = None
+        first_shard_meta: Optional[dict] = None
+        microbatch_losses: List[float] = []
+        tokens_this_step = 0
+
         for _ in range(grad_accum):
             try:
-                input_ids, targets = next(train_iter)
+                batch = next(train_iter)
             except StopIteration:
                 train_iter = _fresh_train_iter()
-                input_ids, targets = next(train_iter)
+                batch = next(train_iter)
+            if len(batch) == 3:
+                input_ids, targets, meta_list = batch
+            else:
+                input_ids, targets = batch
+                meta_list = None
             input_ids = input_ids.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
             tokens_seen += input_ids.numel()
+            tokens_this_step += input_ids.numel()
             if first_input_ids is None:
                 first_input_ids = input_ids
+                first_shard_meta = meta_list[0] if meta_list else None
 
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits, ponder_cost = model(input_ids, n_loops=n_loops)
                 loss, loss_dict = composite_loss_rdt(
-                    model, logits, ponder_cost, targets, config.vocab_size
+                    model, logits, ponder_cost, targets, config.vocab_size,
+                    coeffs=cfg.loss_coeffs,
                 )
                 loss = loss / grad_accum
             loss.backward()
+            microbatch_losses.append(float(loss_dict["total"]))
             loss_accum += loss_dict["total"]
             last_loss_dict = loss_dict
             last_ponder_cost = ponder_cost.detach()
@@ -445,49 +549,94 @@ def train_rdt(
         loss_accum /= grad_accum  # report the average
         last_input_ids_sample = first_input_ids
 
+        # --- NaN/Inf gate (pre-clip, pre-optimizer) ---
+        nan_where = admin.check_nan_inf(last_loss_dict, model)
+        if nan_where is not None:
+            admin.emit_incident("nan_inf", severity="CRIT", step=step, value=nan_where)
+            admin.enqueue_graceful_stop()
+            muon.zero_grad(set_to_none=True)
+            adamw.zero_grad(set_to_none=True)
+            t_step_s = time.perf_counter() - t_step_start
+            admin.update_step_time_rolling(t_step_s)
+            admin.write_status(
+                step=step, total_steps=total_steps, n_loops=n_loops,
+                loss={"total": float("nan")}, nan_detected=True,
+                max_loop_iters=config.max_loop_iters,
+                config_applied_hash=admin.snapshot_state()["config_hash"],
+            )
+            break
+
         # Per-group grad norms (pre-clip) for diagnostic logging
         grad_norms = {name: _per_group_grad_norm(params) for name, params in groups.items()}
+        per_layer_dict = per_layer_grad_norms(
+            model.named_parameters(),
+            prelude_layers=config.prelude_layers,
+            coda_layers=config.coda_layers,
+        )
 
-        # Global clip (applies to both Muon and AdamW params)
-        total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip).item()
+        # Global clip (admin-tunable)
+        total_grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), cfg.grad_clip
+        ).item()
 
         muon.step()
         adamw.step()
         sched_muon.step()
         sched_adamw.step()
 
+        # Apply admin LR multipliers post-scheduler, pre-next-step. Without
+        # this, the multiplier would evaporate each iteration as the scheduler
+        # overwrites param_groups[i]["lr"].
+        muon.param_groups[0]["lr"] *= cfg.lr_mult.get("muon_default", 1.0)
+        muon.param_groups[1]["lr"] *= cfg.lr_mult.get("muon_recurrent", 1.0)
+        adamw.param_groups[0]["lr"] *= cfg.lr_mult.get("adamw_default", 1.0)
+        adamw.param_groups[1]["lr"] *= cfg.lr_mult.get("adamw_recurrent", 1.0)
+
         # DeepSeek-V3 router-bias update: nudge per-expert router_bias toward
         # uniform load using counts accumulated across this step's forwards.
-        # Updates operate on a non-learnable buffer, so they don't interact
-        # with Muon or AdamW state.
-        if config.router_bias_update:
+        # Update rate is admin-tunable (cfg.router_bias_update_rate).
+        if cfg.router_bias_update:
             with torch.no_grad():
                 ffn = model.recurrent.block.ffn
                 counts = ffn._step_expert_counts
                 total = counts.sum().clamp(min=1)
                 target = total / ffn.n_experts
                 imbalance = target - counts
-                ffn.router_bias.add_(config.router_bias_update_rate * torch.sign(imbalance))
+                ffn.router_bias.add_(cfg.router_bias_update_rate * torch.sign(imbalance))
                 ffn.reset_step_expert_counts()
 
         step += 1
+        t_step_s = time.perf_counter() - t_step_start
+        admin.note_step_advanced()
+        admin.update_step_time_rolling(t_step_s)
+        admin.update_loss_rolling(loss_accum)
 
-        # Spectral-radius gates: hard fail at 1.0, warn at 0.999. The hard gate
-        # would indicate a broken invariant (spectral radius is supposed to be
-        # < 1 by construction); the soft warn surfaces drift before it bites.
+        # --- Spectral-radius gates ---
         with torch.no_grad():
             spectral = model.recurrent.injection.get_A().abs().max().item()
         if spectral >= 1.0:
+            admin.emit_incident("spectral_radius_ge_1", severity="CRIT",
+                                 step=step, value=spectral)
             raise RuntimeError(
                 f"LTI stability violated: ρ(A)={spectral:.6f} at step {step}. "
                 f"This should be architecturally impossible."
             )
-        if spectral >= spectral_warn_threshold and step % log_interval == 0:
-            print(f"  WARN: ρ(A)={spectral:.6f} ≥ {spectral_warn_threshold} at step {step}")
+        if spectral >= cfg.spectral_warn_threshold:
+            # Incident emission is unconditional on threshold crossing —
+            # latency matters here, unlike the console print.
+            admin.emit_incident("spectral_near_bound", severity="WARN",
+                                 step=step, value=spectral,
+                                 context={"threshold": cfg.spectral_warn_threshold})
+            if step % log_interval == 0:
+                print(f"  WARN: ρ(A)={spectral:.6f} ≥ "
+                      f"{cfg.spectral_warn_threshold} at step {step}")
 
         # Structural invariant: unique-param count must not change.
         current_param_count = model.unique_param_count()
         if current_param_count != invariant_param_count:
+            admin.emit_incident("invariant_param_count_changed", severity="CRIT",
+                                 step=step, value=current_param_count,
+                                 context={"expected": invariant_param_count})
             raise RuntimeError(
                 f"Invariant violated: unique_param_count went from "
                 f"{invariant_param_count:,} to {current_param_count:,} at step {step}. "
@@ -499,6 +648,18 @@ def train_rdt(
         if len(loss_history) > 200:
             loss_history = loss_history[-200:]
 
+        # --- Detectors (both use admin's rolling buffers) ---
+        spike = admin.loss_spike(loss_accum)
+        if spike is not None:
+            admin.emit_incident("loss_spike", severity="WARN", step=step,
+                                 value=spike[0], context={"baseline_median": spike[1]})
+        regression = admin.step_time_regressed(t_step_s)
+        if regression is not None:
+            admin.emit_incident("step_time_regression", severity="WARN", step=step,
+                                 value=regression[0],
+                                 context={"baseline_median": regression[1]})
+
+        # --- Per-step training metrics (wandb + local events.jsonl tee) ---
         if step % log_interval == 0:
             lrs = {
                 "muon_default": muon.param_groups[0]["lr"],
@@ -506,12 +667,17 @@ def train_rdt(
                 "adamw_default": adamw.param_groups[0]["lr"],
                 "adamw_recurrent": adamw.param_groups[1]["lr"],
             }
-            # Closed-form expected LR per group: schedule desync detector.
+            # Expected LR multiplied by admin LR multiplier so the desync
+            # detector doesn't scream every time the Model tunes a group.
             exp_lrs = {
-                "muon_default": expected_lr(step, warmup_steps, total_steps, lr_muon),
-                "muon_recurrent": expected_lr(step, warmup_steps, total_steps, lr_muon * 0.5),
-                "adamw_default": expected_lr(step, warmup_steps, total_steps, lr_adamw),
-                "adamw_recurrent": expected_lr(step, warmup_steps, total_steps, lr_adamw * 0.5),
+                "muon_default": (expected_lr(step, warmup_steps, total_steps, lr_muon)
+                                  * cfg.lr_mult.get("muon_default", 1.0)),
+                "muon_recurrent": (expected_lr(step, warmup_steps, total_steps, lr_muon * 0.5)
+                                    * cfg.lr_mult.get("muon_recurrent", 1.0)),
+                "adamw_default": (expected_lr(step, warmup_steps, total_steps, lr_adamw)
+                                   * cfg.lr_mult.get("adamw_default", 1.0)),
+                "adamw_recurrent": (expected_lr(step, warmup_steps, total_steps, lr_adamw * 0.5)
+                                     * cfg.lr_mult.get("adamw_recurrent", 1.0)),
             }
             print(
                 f"step {step:>6}/{total_steps} | "
@@ -520,14 +686,35 @@ def train_rdt(
                 f"n_loops {n_loops} | "
                 f"grad {total_grad_norm:.2f} | "
                 f"ρ(A) {spectral:.4f} | "
+                f"t/step {t_step_s:.2f}s | "
                 f"tokens {tokens_seen/1e9:.2f}B"
             )
-            log_training_step(
+            extra = {
+                **timing_metrics(t_step_s, tokens_this_step),
+                **system_metrics(str(ckpt_dir)),
+                **cost_metrics(run_start_wall, cfg.gpu_hourly_rate),
+                "microbatch_loss_cv": microbatch_loss_cv(microbatch_losses),
+                "loss_rolling_mean_200": admin.loss_rolling_mean(),
+            }
+
+            metrics = log_training_step(
                 run, step, last_loss_dict, grad_norms, total_grad_norm, lrs,
-                n_loops, tokens_seen, spectral, model, ponder_cost=last_ponder_cost,
+                n_loops, tokens_seen, spectral, model,
+                ponder_cost=last_ponder_cost,
                 expected_lrs_per_group=exp_lrs,
                 invariant_param_count=invariant_param_count,
+                loss_coeffs=cfg.loss_coeffs,
+                lr_mults=cfg.lr_mult,
+                per_layer_grad_norms_dict=per_layer_dict,
+                extra_metrics=extra,
             )
+            # Attach shard provenance to the admin stream only (wandb panels
+            # don't like string metric values; admin JSONL is unconstrained).
+            if first_shard_meta is not None:
+                metrics = dict(metrics)
+                metrics["first_shard"] = str(first_shard_meta.get("shard", ""))
+                metrics["first_shard_row"] = int(first_shard_meta.get("row", 0))
+            admin.log_metric(step, metrics)
 
         # Per-expert weight-norm & Muon-momentum diagnostics: O(n_experts)
         # tensor reductions, hence throttled.
@@ -535,62 +722,205 @@ def train_rdt(
             log_expert_norms(run, step, model, muon_optim=muon)
 
         # Decoded-sample dump + token-id histogram: data-integrity catch-all.
-        # A human spot-check every few hours would find corrupted shards that
-        # no aggregate scalar will.
         if step % decoded_sample_interval == 0 and last_input_ids_sample is not None:
             log_decoded_sample(run, step, last_input_ids_sample.cpu(), tokenizer)
             log_token_id_histogram(run, step, last_input_ids_sample.cpu(), config.vocab_size)
 
-        # Validation perplexity at current loop count (every eval_interval).
+        # Fixed-prompt generation probe — latency excluded from step-time.
+        gen_probe_interval = cfg.diagnostic_intervals.get("generation_probe", 500)
+        if step % gen_probe_interval == 0 and fixed_prompts:
+            try:
+                probe_results = run_generation_probe(
+                    model, tokenizer, fixed_prompts, device,
+                    n_loops=n_loops, max_new_tokens=32,
+                    temperature=1.0, top_k=50,
+                )
+                for r in probe_results:
+                    admin.log_generation(
+                        step, r["prompt"], r.get("output", ""),
+                        r.get("n_loops", n_loops), r.get("temperature", 1.0),
+                        r.get("top_k", 50), r.get("latency_s", 0.0),
+                        source="panel",
+                    )
+            except Exception as e:
+                admin.emit_incident("generation_probe_failed", severity="WARN",
+                                     step=step, value=str(e))
+
+        # --- Validation perplexity at current loop count (every eval_interval) ---
         if step % eval_interval == 0:
-            val_iter = iter(create_dataloader(data_dir, micro_batch, max_seq_len, split="val"))
-            val_ppl = _evaluate_perplexity(model, val_iter, config.vocab_size, n_loops, device)
+            val_iter = iter(create_dataloader(data_dir, micro_batch, max_seq_len,
+                                               split="val"))
+            val_ppl = _evaluate_perplexity(model, val_iter, config.vocab_size,
+                                            n_loops, device)
             log_eval_metrics(run, step, {f"perplexity_loop{n_loops}": val_ppl})
+            admin.log_metric(step, {f"eval/perplexity_loop{n_loops}": val_ppl,
+                                     "kind": "eval"})
+            admin.emit_incident("eval_perplexity", severity="INFO", step=step,
+                                 value=val_ppl, context={"n_loops": n_loops})
             print(f"  [eval] step {step} perplexity@loop{n_loops} = {val_ppl:.2f}")
 
-        # Depth-extrapolation probe at multiple loop counts: the RDT thesis
-        # lives or dies here. Run at a large cadence to amortize the cost.
+        # --- Depth-extrapolation probe ---
         if step % depth_eval_interval == 0:
             depth_ppls = {}
             for nl in (4, 8, 12, 16):
-                vi = iter(create_dataloader(data_dir, micro_batch, max_seq_len, split="val"))
-                depth_ppls[nl] = _evaluate_perplexity(model, vi, config.vocab_size, nl, device,
-                                                      num_batches=8)
+                vi = iter(create_dataloader(data_dir, micro_batch, max_seq_len,
+                                             split="val"))
+                depth_ppls[nl] = _evaluate_perplexity(model, vi, config.vocab_size,
+                                                      nl, device, num_batches=8)
             log_depth_extrapolation(run, step, depth_ppls)
+            admin.log_metric(step, {f"eval/perplexity_loop{k}": v
+                                      for k, v in depth_ppls.items()})
             print(f"  [depth-eval] step {step} " +
                   "  ".join(f"loop{k}={v:.2f}" for k, v in depth_ppls.items()))
 
-        # Synthetic multi-hop arithmetic: capability probe independent of
-        # data distribution. Detects phase-transition artifacts vs. genuine
-        # compositional generalization.
+        # --- Synthetic multi-hop arithmetic probe ---
         if step % arithmetic_eval_interval == 0:
             try:
-                acc = _evaluate_synthetic_arithmetic(model, tokenizer, device, n_per_depth=20)
+                acc = _evaluate_synthetic_arithmetic(model, tokenizer, device,
+                                                      n_per_depth=20)
                 log_synthetic_arithmetic(run, step, acc)
+                admin.log_metric(step, {f"eval/arith/K{d}_loops{nl}": a
+                                          for (d, nl), a in acc.items()})
                 print(f"  [arith] step {step} " +
                       "  ".join(f"K{d}/L{nl}={a:.2f}" for (d, nl), a in acc.items()))
             except Exception as e:
-                # Tokenizer may not support necessary methods during smoke tests;
-                # don't crash training on an eval-side issue.
                 print(f"  [arith] eval skipped: {e}")
 
-        if step % checkpoint_interval == 0:
-            model.assert_weight_tying()  # structural invariant gate at every ckpt
-            save_checkpoint(
-                model, [muon, adamw], [sched_muon, sched_adamw], curriculum,
-                step, n_loops, loss_history, tokens_seen, config,
-                run.id if run is not None else None,
-                checkpoint_dir=str(ckpt_dir),
-            )
-            rotate_checkpoints(str(ckpt_dir), keep_last_n=5)
+        # --- On-demand commands from admin queue (consumed post-step) ---
+        if admin.pop_checkpoint_request():
+            _do_checkpoint(step, n_loops)
 
-    save_checkpoint(
-        model, [muon, adamw], [sched_muon, sched_adamw], curriculum,
-        step, n_loops, loss_history, tokens_seen, config,
-        run.id if run is not None else None,
-        checkpoint_dir=str(ckpt_dir),
-        checkpoint_name="final_checkpoint.pt",
-    )
+        for req in admin.pop_eval_requests():
+            nl = req["n_loops"]
+            vi = iter(create_dataloader(data_dir, micro_batch, max_seq_len, split="val"))
+            val_ppl = _evaluate_perplexity(model, vi, config.vocab_size, nl, device,
+                                            num_batches=10)
+            admin.log_metric(step, {f"eval/perplexity_loop{nl}": val_ppl,
+                                     "source": "on_demand"})
+            admin.emit_incident("eval_perplexity", severity="INFO", step=step,
+                                 value=val_ppl,
+                                 context={"n_loops": nl, "source": "on_demand"})
+
+        if admin.pop_depth_eval_request():
+            depth_ppls = {}
+            for nl in (4, 8, 12, 16):
+                vi = iter(create_dataloader(data_dir, micro_batch, max_seq_len,
+                                             split="val"))
+                depth_ppls[nl] = _evaluate_perplexity(model, vi, config.vocab_size,
+                                                      nl, device, num_batches=8)
+            log_depth_extrapolation(run, step, depth_ppls)
+            admin.log_metric(step, {f"eval/perplexity_loop{k}": v
+                                      for k, v in depth_ppls.items()})
+
+        arith_req = admin.pop_arith_eval_request()
+        if arith_req is not None:
+            try:
+                acc = _evaluate_synthetic_arithmetic(model, tokenizer, device,
+                                                      n_per_depth=arith_req)
+                log_synthetic_arithmetic(run, step, acc)
+                admin.log_metric(step, {f"eval/arith/K{d}_loops{nl}": a
+                                          for (d, nl), a in acc.items()})
+            except Exception as e:
+                admin.emit_incident("arith_eval_failed", severity="WARN", step=step,
+                                     value=str(e))
+
+        for gen_args in admin.pop_generate_requests():
+            prompt = str(gen_args.get("prompt", ""))
+            try:
+                probe_results = run_generation_probe(
+                    model, tokenizer, [prompt], device,
+                    n_loops=int(gen_args.get("n_loops", n_loops)),
+                    max_new_tokens=int(gen_args.get("max_new_tokens", 64)),
+                    temperature=float(gen_args.get("temperature", 1.0)),
+                    top_k=int(gen_args.get("top_k", 50)),
+                )
+                for r in probe_results:
+                    admin.log_generation(
+                        step, r["prompt"], r.get("output", ""),
+                        r.get("n_loops", n_loops), r.get("temperature", 1.0),
+                        r.get("top_k", 50), r.get("latency_s", 0.0),
+                        source="command",
+                    )
+            except Exception as e:
+                admin.emit_incident("on_demand_generate_failed", severity="WARN",
+                                     step=step, value=str(e))
+
+        for expert_id in admin.pop_reinit_expert_requests():
+            try:
+                ffn = model.recurrent.block.ffn
+                if 0 <= expert_id < len(ffn.routed_experts):
+                    expert = ffn.routed_experts[expert_id]
+                    with torch.no_grad():
+                        nn.init.normal_(expert.gate.weight, std=0.02)
+                        nn.init.normal_(expert.up.weight, std=0.02)
+                        nn.init.normal_(expert.down.weight, std=0.02)
+                        # Depth-scale the residual output projection, matching
+                        # the pattern from OpenMythos._init_weights.
+                        training_max_loops = 8
+                        effective_depth = (config.prelude_layers + training_max_loops
+                                            + config.coda_layers)
+                        depth_scale = 1.0 / math.sqrt(2.0 * effective_depth)
+                        expert.down.weight.mul_(depth_scale)
+                    admin.emit_incident("expert_reinit", severity="INFO", step=step,
+                                         value=expert_id)
+                else:
+                    admin.emit_incident("expert_reinit_out_of_range", severity="WARN",
+                                         step=step, value=expert_id)
+            except Exception as e:
+                admin.emit_incident("expert_reinit_failed", severity="WARN", step=step,
+                                     value=str(e))
+
+        if admin.pop_reset_router_bias_request():
+            with torch.no_grad():
+                model.recurrent.block.ffn.router_bias.zero_()
+            admin.emit_incident("router_bias_reset", severity="INFO", step=step)
+
+        # --- Periodic checkpoint ---
+        if step % checkpoint_interval == 0:
+            _do_checkpoint(step, n_loops)
+
+        # --- Status snapshot + config_applied mirror (end of step) ---
+        lrs_now = {
+            "muon_default": muon.param_groups[0]["lr"],
+            "muon_recurrent": muon.param_groups[1]["lr"],
+            "adamw_default": adamw.param_groups[0]["lr"],
+            "adamw_recurrent": adamw.param_groups[1]["lr"],
+        }
+        sys_now = system_metrics(str(ckpt_dir))
+        cost_now = cost_metrics(run_start_wall, cfg.gpu_hourly_rate)
+        admin.write_status(
+            step=step, total_steps=total_steps, n_loops=n_loops,
+            loss={
+                "total": float(last_loss_dict.get("total", 0.0)),
+                "lm": float(last_loss_dict.get("lm", 0.0)),
+                "moe_aux": float(last_loss_dict.get("moe_aux", 0.0)),
+                "moe_z": float(last_loss_dict.get("moe_z", 0.0)),
+                "act_ponder": float(last_loss_dict.get("act_ponder", 0.0)),
+            },
+            loss_rolling_mean_200=admin.loss_rolling_mean(),
+            grad_norm_total=total_grad_norm,
+            spectral_radius=spectral,
+            lrs=lrs_now,
+            lr_mults_applied=dict(cfg.lr_mult),
+            tokens_seen=tokens_seen,
+            throughput_tokens_per_sec=(tokens_this_step / t_step_s if t_step_s > 0 else 0.0),
+            step_time_s=t_step_s,
+            gpu_mem_peak_gb=sys_now.get("gpu_mem_peak_gb", 0.0),
+            disk_free_gb_ckpt=sys_now.get("disk_free_gb_ckpt", 0.0),
+            wall_hours=cost_now["wall_hours"],
+            estimated_cost_usd=cost_now["estimated_cost_usd"],
+            pause_until_step=cfg.pause_until_step,
+            max_loop_iters=config.max_loop_iters,
+            config_applied_hash=admin.snapshot_state()["config_hash"],
+        )
+        admin.write_config_applied(cfg)
+
+        if admin.should_stop():
+            print(f"Graceful stop requested at step {step}.")
+            break
+
+    # Final checkpoint + cleanup
+    _do_checkpoint(step, n_loops, name="final_checkpoint.pt")
     finish_run(run)
 
     print(f"\nTraining complete.")
@@ -803,6 +1133,8 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no_compile", action="store_true")
+    parser.add_argument("--gpu_hourly_rate", type=float, default=3.50,
+                         help="Cost tracker rate in $/hour; surfaced in admin status.")
     args = parser.parse_args()
 
     use_compile = not args.no_compile
@@ -831,6 +1163,7 @@ def main():
             resume_from=args.resume,
             device=args.device,
             use_torch_compile=use_compile,
+            gpu_hourly_rate=args.gpu_hourly_rate,
         )
     else:
         from configs.baseline import DENSE_BASELINE_CONFIG

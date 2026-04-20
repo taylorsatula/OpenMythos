@@ -208,11 +208,13 @@ class GQAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim)
         self.attn_drop = nn.Dropout(cfg.dropout)
         # Observability: if True, the forward computes an explicit QK matmul
-        # under no_grad to report pre-softmax attention-logit abs-max. Kept off
-        # during normal training (SDPA fuses the matmul and saves memory); the
-        # training harness flips it on periodically for a single forward.
+        # under no_grad to report pre-softmax attention-logit abs-max AND the
+        # mean softmax entropy per head. Kept off during normal training (SDPA
+        # fuses the matmul and saves memory); the training harness flips it on
+        # periodically for a single forward.
         self.diagnostics: bool = False
         self.last_attn_logits_abs_max: torch.Tensor = torch.tensor(0.0)
+        self.last_attn_entropy: torch.Tensor = torch.tensor(0.0)
 
     def forward(
         self,
@@ -261,12 +263,16 @@ class GQAttention(nn.Module):
         # Observability sample (opt-in). SDPA fuses softmax with the matmul,
         # so to see pre-softmax logits we redo the QK matmul under no_grad.
         # Flag is flipped off per-call by the training harness; zero cost
-        # when disabled, single extra bmm when enabled.
+        # when disabled, single extra bmm when enabled. We also compute
+        # softmax entropy — collapsing entropy means attention degenerated
+        # onto a handful of tokens per head.
         if self.diagnostics:
             with torch.no_grad():
                 scale = 1.0 / math.sqrt(q.size(-1))
                 attn_logits = torch.matmul(q.detach(), k.detach().transpose(-2, -1)) * scale
                 self.last_attn_logits_abs_max = attn_logits.abs().amax()
+                log_probs = F.log_softmax(attn_logits, dim=-1)
+                self.last_attn_entropy = -(log_probs.exp() * log_probs).sum(dim=-1).mean()
 
         if mask is not None:
             out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
@@ -528,6 +534,10 @@ class MoEFFN(nn.Module):
         # values mean bf16 saturation is imminent; z-loss should be keeping
         # this bounded. Healthy: stays under ~8. Warning: drifts above 12.
         self.last_router_logits_abs_max: torch.Tensor = torch.tensor(0.0)
+        # Softmax entropy of the routing distribution on the last forward.
+        # Collapsing entropy means routes died silently even before the
+        # dead-expert count reflects it. Always on — nearly free.
+        self.last_router_entropy: torch.Tensor = torch.tensor(0.0)
 
     def reset_loss_accumulators(self) -> None:
         """
@@ -584,10 +594,15 @@ class MoEFFN(nn.Module):
         self.z_loss = self._z_sum / denom
         # Cache most recent topk_idx for eval/utilization analysis.
         self.last_topk_idx = topk_idx.detach()
-        # Capture pre-softmax router logit magnitude for observability.
-        # Tracked outside autograd to avoid any graph retention concerns.
+        # Capture pre-softmax router logit magnitude and softmax entropy for
+        # observability. Tracked outside autograd to avoid any graph retention
+        # concerns. Entropy is recomputed from logits via log_softmax so the
+        # value is numerically stable and independent of the training-path
+        # `scores` tensor (which is still in the autograd graph).
         with torch.no_grad():
             self.last_router_logits_abs_max = logits.detach().abs().amax()
+            log_scores = F.log_softmax(logits.detach(), dim=-1)
+            self.last_router_entropy = -(log_scores.exp() * log_scores).sum(dim=-1).mean()
 
         # Accumulate per-optimizer-step expert counts for the DeepSeek-V3
         # router-bias update. Counted every loop iteration and every

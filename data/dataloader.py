@@ -29,12 +29,14 @@ class PackedSequenceDataset(IterableDataset):
         split: str = "train",
         shuffle_shards: bool = True,
         seed: int = 42,
+        return_meta: bool = False,
     ):
         self.data_dir = data_dir
         self.seq_len = seq_len
         self.split = split
         self.shuffle_shards = shuffle_shards
         self.seed = seed
+        self.return_meta = return_meta
 
         self.shard_paths = sorted(Path(data_dir).glob(f"{split}_*.parquet"))
         if not self.shard_paths:
@@ -55,19 +57,30 @@ class PackedSequenceDataset(IterableDataset):
         expected_len = self.seq_len + 1
         for shard in my_shards:
             table = pq.read_table(shard, columns=["tokens"])
-            for row in table.column("tokens"):
+            shard_name = shard.name
+            for row_idx, row in enumerate(table.column("tokens")):
                 tokens = row.as_py()
                 if len(tokens) != expected_len:
                     # Shards written for a different seq_len; skip gracefully.
                     continue
                 t = torch.tensor(tokens, dtype=torch.long)
-                yield t[:-1], t[1:]
+                if self.return_meta:
+                    yield t[:-1], t[1:], {"shard": shard_name, "row": row_idx}
+                else:
+                    yield t[:-1], t[1:]
 
 
 def _collate(rows):
     input_ids = torch.stack([r[0] for r in rows])
     targets = torch.stack([r[1] for r in rows])
     return input_ids, targets
+
+
+def _collate_with_meta(rows):
+    input_ids = torch.stack([r[0] for r in rows])
+    targets = torch.stack([r[1] for r in rows])
+    meta = [r[2] for r in rows]
+    return input_ids, targets, meta
 
 
 def create_dataloader(
@@ -77,9 +90,11 @@ def create_dataloader(
     split: str = "train",
     num_workers: int = 4,
     seed: int = 42,
+    return_meta: bool = False,
 ) -> DataLoader:
     dataset = PackedSequenceDataset(
         data_dir=data_dir, seq_len=seq_len, split=split, seed=seed,
+        return_meta=return_meta,
     )
     return DataLoader(
         dataset,
@@ -87,5 +102,5 @@ def create_dataloader(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        collate_fn=_collate,
+        collate_fn=_collate_with_meta if return_meta else _collate,
     )
