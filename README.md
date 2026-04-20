@@ -1,419 +1,132 @@
-# OpenMythos
+# OpenMythos — Training Harness Fork
 
-<p align="left">
-  <a href="https://pypi.org/project/open-mythos/" target="_blank">
-    <picture>
-      <source srcset="https://img.shields.io/pypi/v/open-mythos?style=for-the-badge&color=3670A0" media="(prefers-color-scheme: dark)">
-      <img alt="Version" src="https://img.shields.io/pypi/v/open-mythos?style=for-the-badge&color=3670A0">
-    </picture>
-  </a>
-  <a href="https://twitter.com/kyegomezb/">
-    <picture>
-      <source srcset="https://img.shields.io/badge/Twitter-Follow-1DA1F2?style=for-the-badge&logo=twitter&logoColor=white" media="(prefers-color-scheme: dark)">
-      <img src="https://img.shields.io/badge/Twitter-Follow-1DA1F2?style=for-the-badge&logo=twitter&logoColor=white" alt="Twitter">
-    </picture>
-  </a>
-  <a href="https://discord.gg/3keGBK9Pvr" target="_blank">
-    <picture>
-      <source srcset="https://img.shields.io/badge/Discord-Join-5865F2?style=for-the-badge&logo=discord&logoColor=white" media="(prefers-color-scheme: dark)">
-      <img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?style=for-the-badge&logo=discord&logoColor=white">
-    </picture>
-  </a>
-  <a href="https://pytorch.org" target="_blank">
-    <picture>
-      <source srcset="https://img.shields.io/badge/PyTorch-Implemented-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white" media="(prefers-color-scheme: dark)">
-      <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-Implemented-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white">
-    </picture>
-  </a>
-</p>
+A fork of [`kyegomez/OpenMythos`](https://github.com/kyegomez/OpenMythos) that adds a complete training harness on top of the upstream architecture code. The upstream repo provides the model definition (Recurrent-Depth Transformer with MoE FFN, MLA/GQA attention, LTI-stable injection, ACT halting); this fork adds everything else needed to actually train the thing end-to-end on a single H200.
 
-> **Disclaimer:** OpenMythos is an independent, community-driven theoretical reconstruction based solely on publicly available research and speculation. It is not affiliated with, endorsed by, or connected to Anthropic or any of their proprietary systems.
-
-OpenMythos is an open-source, theoretical implementation of the Claude Mythos model. It implements a Recurrent-Depth Transformer (RDT) with three stages: **Prelude** (transformer blocks), a looped **Recurrent Block** (up to `max_loop_iters`), and a final **Coda**. Attention is switchable between MLA and GQA, and the feed-forward uses a sparse MoE with routed and shared experts ideal for exploring compute-adaptive, depth-variable reasoning.
-
-
-## Installation
-
-```bash
-pip install open-mythos
-
-#uv pip install open-mythos
-```
-
-## Usage
-
-```python
-
-import torch
-from open_mythos.main import OpenMythos, MythosConfig
-
-
-attn_type = "mla"  # or "gqa"
-
-base = {
-    "vocab_size": 1000,
-    "dim": 256,
-    "n_heads": 8,
-    "max_seq_len": 128,
-    "max_loop_iters": 4,
-    "prelude_layers": 1,
-    "coda_layers": 1,
-    "n_experts": 8,
-    "n_shared_experts": 1,
-    "n_experts_per_tok": 2,
-    "expert_dim": 64,
-    "lora_rank": 8,
-    "attn_type": attn_type,
-}
-
-if attn_type == "gqa":
-    cfg = MythosConfig(**base, n_kv_heads=2)
-else:
-    cfg = MythosConfig(
-        **base,
-        n_kv_heads=8,
-        kv_lora_rank=32,
-        q_lora_rank=64,
-        qk_rope_head_dim=16,
-        qk_nope_head_dim=16,
-        v_head_dim=16,
-    )
-
-model = OpenMythos(cfg)
-total = sum(p.numel() for p in model.parameters())
-print(f"\n[{attn_type.upper()}] Parameters: {total:,}")
-
-ids = torch.randint(0, cfg.vocab_size, (2, 16))
-logits = model(ids, n_loops=4)
-print(f"[{attn_type.upper()}] Logits shape: {logits.shape}")
-
-out = model.generate(ids, max_new_tokens=8, n_loops=8)
-print(f"[{attn_type.upper()}] Generated shape: {out.shape}")
-
-A = model.recurrent.injection.get_A()
-print(
-    f"[{attn_type.upper()}] Spectral radius ρ(A) max: {A.max().item():.4f} (must be < 1)"
-)
-```
-
-
-
-## Model Variants
-
-Pre-configured scales from 1B to 1T parameters:
-
-```python
-from open_mythos import (
-    mythos_1b,
-    mythos_3b,
-    mythos_10b,
-    mythos_50b,
-    mythos_100b,
-    mythos_500b,
-    mythos_1t,
-    OpenMythos,
-)
-
-cfg = mythos_7b()  # returns a MythosConfig
-model = OpenMythos(cfg)
-
-total = sum(p.numel() for p in model.parameters())
-print(f"Parameters: {total:,}")
-```
-
-| Variant | `dim` | Experts | `expert_dim` | Loop iters | Context | Max output |
-|---|---|---|---|---|---|---|
-| `mythos_1b` | 2048 | 64 | 2048 | 16 | 4k | 4k |
-| `mythos_3b` | 3072 | 64 | 4096 | 16 | 4k | 4k |
-| `mythos_10b` | 4096 | 128 | 5632 | 24 | 8k | 4k |
-| `mythos_50b` | 6144 | 256 | 9728 | 32 | 8k | 4k |
-| `mythos_100b` | 8192 | 256 | 13568 | 32 | 1M | 128k |
-| `mythos_500b` | 12288 | 512 | 23040 | 48 | 1M | 128k |
-| `mythos_1t` | 16384 | 512 | 34560 | 64 | 1M | 128k |
+> **Status: untested at scale.** The smoke test suite passes and the code is internally consistent with the design captured in [`HANDOFF.md`](HANDOFF.md). However, **no full-scale training run has been executed**. Expect bugs that only surface once the real data pipeline, H200 hardware, and 15B-token workload are exercised together. Treat this as a well-organized first-draft harness, not a battle-tested one.
 
 ---
 
-## Training
+## What's in the fork
 
-The training script for the 3B model on FineWeb-Edu is at [`training/3b_fine_web_edu.py`](training/3b_fine_web_edu.py).
+### Upstream (preserved)
+- `open_mythos/main.py` — RDT model (Prelude → looped Recurrent Block → Coda), MoE, GQA/MLA attention, LTI injection, ACT, LoRA, loop-index embedding.
+- `open_mythos/baseline.py` — FLOP-matched dense transformer baseline.
+- `open_mythos/tokenizer.py` — `MythosTokenizer` wrapping `openai/gpt-oss-20b`.
+- `open_mythos/variants.py` — 1B–1T preset configs.
 
-**Single GPU:**
-```bash
-python training/3b_fine_web_edu.py
-```
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the upstream README with the full hypothesis write-up.
 
-**Multi-GPU (auto-detects GPU count):**
-```bash
-torchrun --nproc_per_node=$(python -c "import torch; print(torch.cuda.device_count())") training/3b_fine_web_edu.py
-```
+### Added in this fork
 
-Key design choices:
+**Training pipeline**
+- `training/train.py` — RDT + dense baseline training loops, Muon+AdamW hybrid optimizer, shared warmup-cosine schedule across both, step-unit-correct gradient accumulation, bf16 autocast (no GradScaler), global grad-clip, per-group grad-norm logging, spectral-radius safety gate, `torch.compile` on Prelude/Coda (not the recurrent loop).
+- `training/muon.py` — vendored [Keller Jordan Muon](https://github.com/KellerJordan/modded-nanogpt) optimizer with Newton-Schulz orthogonalization in fp32, Nesterov momentum, shape-scaled updates, decoupled weight decay. Routed: 2D transformer matrices + MoE expert matrices. Everything else (embeddings, norms, 1D tensors) goes to AdamW. Moonshot's Moonlight 16B MoE paper validated this split.
+- `training/losses.py` — composite loss (LM + MoE aux + MoE z-loss + ACT ponder), reading from the running-mean accumulators.
+- `training/curriculum.py` — loop-depth curriculum: linear ramp 1→8 over first 30%, then plateau samples `n_loops ~ U[4, max_loop_iters]` so LoRA scale slots for loops 8..15 also receive gradient signal. RNG serialized in checkpoints for resume determinism.
+- `training/checkpointing.py` — full state save/restore: both optimizer state dicts, both scheduler states, curriculum state (incl. RNG), torch/cuda/numpy/python RNG, step/tokens/loss-history, the `MythosConfig` used to build the model, and the wandb run id. Rank-0 guard. Checkpoint rotation.
 
-| Feature | Detail |
+**Architectural additions to `open_mythos/main.py`**
+- **MoE aux + z-loss accumulators** with a `reset_loss_accumulators()` hook called at the top of every `OpenMythos.forward`. Previously `aux_loss` was overwritten every loop iteration, so T−1 loops worth of routing signal was discarded. Now the optimizer sees the mean across all loop iterations; Switch-T coefficient semantics preserved.
+- **ST-MoE z-loss** — `logsumexp(router_logits)² mean` with coefficient 1e-3. Keeps router logits bounded under bf16.
+- **QK-norm** (DeepSeek-V3 / Gemma-2 style) on both GQA and MLA. Bounds attention logits across the looped recurrent block where the same attention runs T times.
+- **Depth-scaled output projections** at init: `attn.wo` and `ffn.down` multiplied by `1/sqrt(2 · effective_depth) ≈ 0.177` (effective_depth = prelude + max_loops_train + coda = 16). Standard GPT-2 trick adapted for the effective depth of a looped model.
+- **ACT halt bias `= −2.0`** so the halting head starts at sigmoid(−2) ≈ 0.12, preventing collapse-at-step-1.
+- **LTI near-identity init**: `log_A = log(−log(0.9)) ≈ −2.25`, `log_dt = 0`, giving `A_init ≈ 0.9` per channel. Previously `log_A = 0` gave `A ≈ 0.37` — 63% hidden-state decay per loop before the transformer even contributes.
+- `muon_param_predicate` helper for clean Muon-vs-AdamW parameter routing.
+
+**Data pipeline**
+- `data/dataloader.py` — real Parquet-backed `PackedSequenceDataset` (previously a random-tensor stub that silently fed the trainer with noise).
+- `data/prepare_data.py` — real streaming download/filter/dedup/tokenize/pack pipeline for the 5-source mix (FineWeb-Edu, OpenWebMath, The Stack v2 dedup, Wikipedia, arXiv). Writes zstd-compressed Parquet shards.
+- `data/synthetic.py` — multi-hop arithmetic generator with intermediate values shown, answer maskable at eval time, isolated `random.Random(seed)` per call.
+
+**Utilities and eval**
+- `utils/count_params.py` — unique-tensor counting (previously double-counted the tied LM head). Auto-pulls tokenizer vocab size.
+- `utils/count_flops.py` — `find_matching_layers()` for the FLOP-matched dense baseline. Currently recommends **24 layers** for the configured RDT.
+- `utils/logging.py` — per-group grad norms + LRs, dead-expert count, halt-mean, spectral radius, wandb `resume='must'` support.
+- `eval/expert_util.py` — hook-based expert counting via the `MoEFFN.last_topk_idx` cache (previously referenced a non-existent `router.expert_counts` attribute).
+- `eval/perplexity.py`, `eval/act_profile.py` — dropped the `model.train()` side effect that clobbered caller mode.
+- `eval/arithmetic.py` — masked-prompt evaluation; decode only generated tokens (avoids extracting answer from the echoed prompt).
+
+**Scripts**
+- `scripts/run_training.sh` — launch script. `CUDA_LAUNCH_BLOCKING=1` removed (it serializes kernel launches and ~3×'d the step time).
+- `scripts/smoke_test.py` — 9 tests covering forward-return signature, init overrides (ACT bias, LTI A_init, QK-norm presence), MoE aux/z-loss accumulator reset per forward, spectral radius < 1, 4-group optimizer partition (muon/adamw × default/recurrent), gradient flow through all groups, loss-decrease on a copy-task toy, curriculum plateau coverage, and checkpoint round-trip (both optimizer states, both schedulers, curriculum RNG).
+
+**Documentation**
+- [`HANDOFF.md`](HANDOFF.md) — the full technical spec driving the training work. Covers optimizer, losses, curriculum, gradient accumulation, init, mixed precision, data pipeline, baseline FLOP matching, eval, logging, checkpointing, infrastructure, execution order, and a debugging guide.
+
+---
+
+## Target configuration
+
+| | Value |
 |---|---|
-| Optimizer | Muon for 2D weight matrices, AdamW for embeddings/norms |
-| Dataset | `HuggingFaceFW/fineweb-edu` (`sample-10BT` by default, swap to `sample-100BT` or `default` for full run) |
-| Tokenizer | `openai/gpt-oss-20b` via `MythosTokenizer` |
-| Parallelism | PyTorch DDP via `torchrun`, sharded streaming dataset |
-| Precision | bfloat16 on H100/A100, float16 + GradScaler on older GPUs |
-| Schedule | Linear warmup (2000 steps) → cosine decay |
-| Target | 30B tokens (~Chinchilla-adjusted for looped architecture) |
+| Architecture | RDT with GQA attention + MoE FFN |
+| Dim | 2048 |
+| Prelude / Coda layers | 4 / 4 |
+| Max loop iters (inference) | 16 |
+| Max loops (training) | 8 (ramp) → sampled in plateau |
+| Experts | 192 routed + 2 shared, `expert_dim=1024`, top-4 routing |
+| Tokenizer | `openai/gpt-oss-20b`, ~201k vocab |
+| Transformer body | **1.49B params** (measured) |
+| Embedding + tied head | ~410M |
+| Total | **1.90B params** |
+| Context | 2048 |
+| Target tokens | 15B |
+| Global batch | 512k tokens (micro-batch 32 × grad_accum 8 × seq 2048) |
+| Optimizer steps | ~29 000 |
+| Peak LR | 0.02 (Muon), 3e-4 (AdamW); half for recurrent group in both |
+| Schedule | Linear warmup 2 000 steps → cosine to 10% |
+| Target hardware | H200-141GB single GPU on Vast.AI (~55 hr, ~$195) |
+| Baseline dense layers | 24 (FLOP-matched to RDT @ 8 loops; ratio 1.004) |
 
 ---
 
-## Documentation
-
-| Page | Description |
-|---|---|
-| [`docs/open_mythos.md`](docs/open_mythos.md) | Full API reference for the `OpenMythos` class — constructor, `forward`, `generate`, all sub-modules, configuration reference, and usage examples |
-| [`docs/datasets.md`](docs/datasets.md) | Recommended training datasets with token budget guidance per model size |
-
----
-
-## The Central Hypothesis
-
-Claude Mythos is suspected to be a **Recurrent-Depth Transformer (RDT)** — also called a Looped Transformer (LT). Rather than stacking hundreds of unique layers, a subset of layers is recycled and run through multiple times per forward pass. Same weights. More loops. Deeper thinking.
-
-This is not chain-of-thought. There is no intermediate token output. All of this reasoning happens **silently, inside a single forward pass**, in continuous latent space.
-
----
-
-## Architecture
-
-A looped transformer divides its layers into three functional blocks:
-
-```
-Input
-  ↓
-[Prelude P]        — standard transformer layers, run once
-  ↓
-[Recurrent Block R] — looped T times
-  ↑_______↓         (hidden state h updated each loop with input injection e)
-  ↓
-[Coda C]           — standard transformer layers, run once
-  ↓
-Output
-```
-
-The recurrent block update rule at each loop step t:
-
-```
-h_{t+1} = A·h_t + B·e + Transformer(h_t, e)
-```
-
-Where:
-- `h_t` is the hidden state after loop t
-- `e` is the encoded input (from the Prelude), injected at every loop
-- `A` and `B` are learned injection parameters
-- The Transformer blocks apply attention and MLP as usual
-
-The injection of `e` at every step is what prevents the model from drifting — it keeps the original input signal alive throughout the entire recurrence depth.
-
-The full implementation is in [`open_mythos/main.py`](open_mythos/main.py). See the [`OpenMythos` class reference](docs/open_mythos.md) for a detailed API walkthrough, configuration options, and usage examples.
-
----
-
-## Why This Explains Mythos
-
-### 1. Systematic Generalization
-
-Vanilla transformers fail to combine knowledge in ways they have never seen during training. Looped transformers pass this test. The ability emerges through a **three-stage grokking process**:
-
-1. Memorization — model fits training distribution
-2. In-distribution generalization — model handles known compositions
-3. Systematic generalization — model handles novel compositions OOD, abruptly and suddenly
-
-This is why Mythos feels qualitatively different from other models on novel questions — the capability phase-transitions in, rather than emerging gradually.
-
-### 2. Depth Extrapolation
-
-Train on 5-hop reasoning chains. Test on 10-hop. Vanilla transformer fails. Looped transformer succeeds — by running more inference-time loops. This maps directly to the observation that Mythos handles deeply compositional problems (multi-step math, long-horizon planning, layered arguments) without explicit chain-of-thought.
-
-More loops at inference = deeper reasoning chains = harder problems solved.
-
-### 3. Latent Thoughts as Implicit Chain-of-Thought
-
-Each loop iteration is the functional equivalent of one step of chain-of-thought, but operating in continuous latent space rather than token space. A looped model running T loops implicitly simulates T steps of CoT reasoning. This has been formally proven (Saunshi et al., 2025).
-
-Furthermore, continuous latent thoughts — unlike discrete token outputs — can encode **multiple alternative next steps simultaneously**. This allows something closer to breadth-first search over the reasoning space, rather than a single committed reasoning path. The model is effectively exploring many possible directions inside each forward pass before converging.
-
-### 4. No Parameter Explosion
-
-A looped model with k layers run L times achieves the quality of a kL-layer non-looped model, with only k layers worth of parameters. For Mythos-scale deployments, this matters enormously:
-
-- Memory footprint does not grow with reasoning depth
-- Inference-time compute scales with loop count, not model size
-- This makes deeper reasoning "free" in terms of parameters
-
----
-
-## The Stability Problem (and How It Was Likely Solved)
-
-Training looped models is notoriously unstable. Two failure modes dominate:
-
-- **Residual explosion** — the hidden state `h_t` grows unboundedly across loops
-- **Loss spikes** — training diverges suddenly due to large spectral norms in injection parameters
-
-### The Dynamical Systems View
-
-Recast looping as a discrete linear time-invariant (LTI) dynamical system over the residual stream. Ignoring the nonlinear Transformer contribution, the recurrence becomes:
-
-```
-h_{t+1} = A·h_t + B·e
-```
-
-For this LTI system, stability is governed entirely by the **spectral radius** of A:
-- `ρ(A) < 1` → stable, convergent
-- `ρ(A) ≥ 1` → unstable, divergent
-
-Empirically, every divergent training run learns `ρ(A) ≥ 1`. Every convergent run maintains `ρ(A) < 1`.
-
-### The Fix
-
-Constrain the injection parameters so that stability is guaranteed **by construction**:
-
-1. Parameterize A as a continuous negative diagonal matrix
-2. Discretize using ZOH/Euler schemes: `A_discrete = exp(Δt · A_continuous)`
-3. Enforce negativity via `A := Diag(-exp(log_A))` with a learned scalar `Δt`
-4. This ensures `ρ(A) < 1` always holds, regardless of learning rate or batch noise
-
-The result: the looped model becomes significantly more robust to hyperparameter selection and trains cleanly even at high learning rates. This is the Parcae architecture (Prairie et al., 2026), and it represents the most likely class of solution Anthropic used to make Mythos trainable.
-
----
-
-## Scaling Laws for Looped Models
-
-Parcae establishes the first predictable scaling laws for looped training:
-
-- **Training**: For a fixed FLOP budget with fixed parameters, increasing mean recurrence and reducing token count yields a lower loss than training with minimal loops on more data. Optimal recurrence and optimal token count both follow **power laws** with consistent exponents across scales.
-- **Inference**: More test-time loops improves quality following a **predictable, saturating exponential decay** — gains are real but diminishing. This mirrors the inference-time scaling of chain-of-thought.
-
-At 770M parameters, a looped model achieves the downstream quality of a 1.3B fixed-depth Transformer trained on the same data — roughly **half the parameters for the same quality**.
-
-Applied to Mythos: if trained under these scaling laws, Mythos could be dramatically more parameter-efficient than it appears, with a large fraction of its apparent "capability" coming from loop depth rather than raw parameter count.
-
----
-
-## The Loop Index Embedding Hypothesis
-
-A key open question is whether the looped block behaves **identically** on every iteration, or whether it can learn to do different things at different loop depths.
-
-Without any positional signal across loops, the same weights must handle both early-stage pattern matching and late-stage refinement — a tight constraint. A **RoPE-like embedding of the loop index** injected alongside the input at each step would allow the same parameters to implement functionally distinct operations across iterations, much like how RoPE allows the same attention heads to behave differently at different sequence positions.
-
-If Mythos uses this technique, each loop is not a repetition — it is a distinct computational phase, all sharing weights but operating in different representational regimes. This would substantially increase the expressiveness of the recurrent block without increasing parameter count.
-
----
-
-## The Overthinking Problem
-
-More loops is not always better. Beyond a certain depth, excessive recurrence **degrades predictions** — the hidden state drifts past the solution and into noise. This is the "overthinking" failure mode.
-
-The original Universal Transformer (Dehghani et al., 2018) addressed this with an **Adaptive Computation Time (ACT)** halting mechanism: a learned scalar per position that dynamically decides when to stop looping. Positions that are harder to process receive more computation; simple tokens halt early.
-
-Mythos almost certainly has some version of this. The model cannot naively run the maximum number of loops on every input — it needs a learned signal for when the answer has converged. The ACT mechanism also makes the model **Turing-complete** under certain assumptions, which has theoretical implications for the class of problems it can solve.
-
----
-
-## Mixture of Experts — Suspected for Large Parameter Counts
-
-The looped transformer explains the depth of Mythos's reasoning, but not the breadth. Handling wildly different domains — code, math, literature, science, law — with the same weights requires **Mixture of Experts (MoE)**. The suspected design replaces every FFN in the Recurrent Block with a fine-grained MoE layer: each FFN is split into many small experts (1/m the normal size), a router selects the top-mK of them per token via learned affinity scores, and a small number of **shared experts** are always activated regardless of routing to absorb common cross-domain knowledge — syntax, basic reasoning, general context — that would otherwise be redundantly learned by every routed expert. Routing collapse is prevented through a bias term on the router logits adjusted dynamically during training, keeping load balanced across experts without distorting the loss signal. 
-
-As the hidden state `h_t` evolves across loop iterations, the router may select different expert subsets at each depth, making every loop computationally distinct despite shared weights. MoE provides breadth; looping provides depth. If the activation ratio is ~5%, Mythos could hold hundreds of billions of total parameters while activating only a small fraction per token — the true parameter count, if ever disclosed, would be a storage number, not a compute number.
-
----
-
-## The Memorization-Reasoning Tradeoff
-
-Looped models exhibit an interesting dichotomy: looping improves reasoning but can hurt memorization. The recurrent structure is optimized for iterative composition — running a reasoning chain forward — but does not inherently improve the storage of rote facts.
-
-This maps to an observable characteristic of Mythos: it reasons exceptionally well about novel problems it has never seen, but its factual recall can be inconsistent. The architecture is structurally biased toward composition over memorization.
-
-Looping-based regularization (Saunshi et al., 2025) can be used to balance this tradeoff during training — applying stronger looping constraints for reasoning tasks while relaxing them for retrieval tasks.
-
----
-
-## Parameter Reuse via LoRA Adaptation
-
-A complementary approach from Relaxed Recursive Transformers (Bae et al., 2024): rather than requiring fully identical weights at every loop, add a small **depth-wise LoRA module** at each iteration. This preserves the compactness of weight sharing while allowing each loop to adapt its behavior slightly.
-
-The result:
-- Each loop shares a large common weight matrix (the recursive base)
-- A small rank-r adaptation matrix shifts behavior per iteration depth
-- The total parameter overhead is minimal
-
-This bridges the gap between pure weight-tying (maximally parameter-efficient, less expressive) and fully distinct layers (maximally expressive, no parameter savings). Mythos likely sits somewhere on this spectrum.
-
----
-
-## Continuous Depth-wise Batching
-
-A downstream consequence of the recursive architecture: **Continuous Depth-wise Batching**. Because all tokens share the same recurrent block, the model can exit the loop at different depths for different tokens or sequences — processing easy inputs quickly and hard inputs with more iterations, all within the same batch.
-
-Theoretical analysis suggests 2-3x improvements in inference throughput. For a deployed model like Mythos serving many users simultaneously, this would be a substantial efficiency gain.
-
----
-
-## Summary: What Mythos Probably Is
-
-| Property | Description |
-|---|---|
-| Architecture | Recurrent-Depth Transformer (Prelude + Looped Recurrent Block + Coda) |
-| FFN layer | Suspected MoE — fine-grained experts + always-on shared experts |
-| Parameter count | Very large total; small fraction activated per token (~5% estimate) |
-| Reasoning mechanism | Implicit multi-hop via iterative latent updates — no token output between steps |
-| Inference-time scaling | More loops = deeper reasoning, following predictable exponential decay |
-| Training stability | LTI-constrained injection parameters with spectral radius < 1 |
-| Loop differentiation | Likely uses loop-index positional embedding (à la RoPE) per iteration |
-| Halting | Adaptive Computation Time or learned convergence criterion |
-| Scaling law | Optimal training scales looping and data together, not parameters alone |
-| Reasoning vs. memory | Structurally biased toward composition; memorization requires separate treatment |
-| Deployment | Continuous Depth-wise Batching enables variable compute per request |
-
----
-
-## References
-
-### Twitter / X
-
-- Why Claude Mythos is so good — looped transformer theory (Sigrid Jin): https://x.com/realsigridjin/status/2044620031410266276
-- LT implicit reasoning over parametric knowledge unlocks generalization (Yuekun Yao): https://x.com/yuekun_yao/status/2044229171627639004
-- Looped transformer cyclic trajectories and input injection (rosinality): https://x.com/rosinality/status/2043953033428541853
-- Parcae scaling laws for stable looped language models — thread (Hayden Prairie): https://x.com/hayden_prairie/status/2044453231913537927
-- RoPE-like loop index embedding idea to differentiate functions across iterations (davidad): https://x.com/davidad/status/2044453231913537927
-- On the Looped Transformers Controversy by ChrisHayduk: https://x.com/ChrisHayduk/status/2045947623572688943
-- On the Looped Transformers Controversy Summary by @realsigridjin https://x.com/realsigridjin/status/2046012743778766875
-
-
-### Papers
-
-- Fine-grained expert segmentation and shared expert isolation in MoE: https://arxiv.org/abs/2401.06066
-- Loop, Think, & Generalize — Implicit Reasoning in Recurrent Depth Transformers: https://arxiv.org/pdf/2604.07822
-- Parcae — Scaling Laws for Stable Looped Language Models: https://arxiv.org/abs/2604.12946
-- Parcae blog: https://sandyresearch.github.io/parcae/
-- Universal Transformers: https://arxiv.org/pdf/1807.03819
-- Reasoning with Latent Thoughts — On the Power of Looped Transformers: https://arxiv.org/abs/2502.17416
-- Training Large Language Models to Reason in a Continuous Latent Space: https://arxiv.org/abs/2412.06769
-- Relaxed Recursive Transformers — Effective Parameter Sharing with Layer-wise LoRA: https://arxiv.org/pdf/2410.20672
-- Mixture-of-Depths Attention: https://arxiv.org/abs/2603.15619
-
----
-
-## Citation
-
-If you use OpenMythos in your research or build on this work, please cite:
-
-```bibtex
-@software{gomez2026openmythos,
-  author    = {Kye Gomez},
-  title     = {OpenMythos: A Theoretical Reconstruction of the Claude Mythos Architecture},
-  year      = {2026},
-  url       = {https://github.com/kyegomez/OpenMythos},
-  note      = {Recurrent-Depth Transformer with MoE, MLA, LTI-stable injection, and ACT halting}
-}
+## How to run
+
+1. **Environment**: PyTorch ≥ 2.4, CUDA 12.x, `transformers`, `datasets`, `pyarrow`, `wandb`.
+2. **Verify the config**:
+   ```bash
+   python -m utils.count_params   # should report transformer body ~1.49B
+   python -m utils.count_flops    # should report 24 dense layers @ matched FLOPs
+   ```
+3. **Prepare data** (run once on a box with bandwidth; ~60 GB disk + HF auth):
+   ```bash
+   python -m data.prepare_data --target_tokens 15_000_000_000
+   ```
+4. **Smoke test** (CPU is fine):
+   ```bash
+   python -m scripts.smoke_test
+   ```
+5. **Train**:
+   ```bash
+   bash scripts/run_training.sh rdt
+   # or for the baseline:
+   bash scripts/run_training.sh baseline
+   ```
+
+Resume-from-checkpoint:
+```bash
+bash scripts/run_training.sh rdt --resume outputs/rdt_1.5b/checkpoints/checkpoint_step_5000.pt
 ```
 
 ---
+
+## What is *not* yet done
+
+- **No full training run has happened.** The code has not been exercised against the 15B-token FineWeb-Edu+code+math mix on H200 (or any other production setting). Expect some combination of: Parquet shard schema mismatches the first time `prepare_data.py` is run at scale, `torch.compile` recompile storms on sequence-length variations, MoE routing collapse under Muon that the smoke test can't surface at tiny scale, off-by-one in `next()` iteration handling when the data stream rolls over, numerical surprises in the Newton-Schulz iteration at bf16 boundaries, and/or activation-memory regressions from `torch.compile`'s chosen graph. The smoke test validates the *plumbing*; it cannot validate training dynamics.
+- The [DeepSeek-V3 router bias update](https://arxiv.org/abs/2412.19437) is wired into the model (the `router_bias` buffer is added to logits) but the post-step update loop is **not implemented**. Add it if expert-utilization collapse appears during real training.
+- Document-boundary attention masking via FlexAttention — deferred.
+- FP8 training via Transformer Engine — deferred.
+- Distributed Muon — single-GPU only for now.
+
+---
+
+## Credits
+
+- Upstream model, theory, and documentation: [Kye Gomez, OpenMythos](https://github.com/kyegomez/OpenMythos). See [`ARCHITECTURE.md`](ARCHITECTURE.md).
+- Muon optimizer: [Keller Jordan, modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt).
+- Muon+MoE validation: [Liu et al., "Muon is Scalable for LLM Training" / Moonlight 16B](https://arxiv.org/abs/2502.16982) (Feb 2025).
 
 ## License
 
-MIT License — Copyright (c) 2026 Kye Gomez. See [`LICENSE`](LICENSE) for the full text.
+MIT — inherited from the upstream [OpenMythos](https://github.com/kyegomez/OpenMythos). See [`LICENSE`](LICENSE).

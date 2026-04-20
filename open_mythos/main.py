@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -190,6 +191,11 @@ class GQAttention(nn.Module):
         self.wk = nn.Linear(cfg.dim, cfg.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(cfg.dim, cfg.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(cfg.n_heads * self.head_dim, cfg.dim, bias=False)
+        # QK-norm (DeepSeek-V3 / Gemma-2): per-head RMSNorm on Q and K before RoPE.
+        # Bounds attention logits across the looped recurrent block where the same
+        # attention runs T times and errors compound.
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
         self.attn_drop = nn.Dropout(cfg.dropout)
 
     def forward(
@@ -216,6 +222,9 @@ class GQAttention(nn.Module):
         k = self.wk(x).view(B, T, self.n_kv_heads, self.head_dim)
         v = self.wv(x).view(B, T, self.n_kv_heads, self.head_dim)
 
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
         q = apply_rope(q, freqs_cis)
         k = apply_rope(k, freqs_cis)
 
@@ -233,12 +242,12 @@ class GQAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        scale = self.head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
         if mask is not None:
-            attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        elif T > 1:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -311,6 +320,11 @@ class MLAttention(nn.Module):
             bias=False,
         )
 
+        # QK-norm on the per-head nope components only (rope components are already
+        # magnitude-bounded by the complex phasor). Mirrors DeepSeek-V3's MLA stack.
+        self.q_head_norm = RMSNorm(cfg.qk_nope_head_dim)
+        self.k_head_norm = RMSNorm(cfg.qk_nope_head_dim)
+
         self.wo = nn.Linear(cfg.n_heads * cfg.v_head_dim, cfg.dim, bias=False)
         self.attn_drop = nn.Dropout(cfg.dropout)
 
@@ -339,6 +353,7 @@ class MLAttention(nn.Module):
         c_q = self.q_norm(self.q_down(x))
         q_nope = self.q_up_nope(c_q).view(B, T, self.n_heads, self.qk_nope_dim)
         q_rope = self.q_up_rope(c_q).view(B, T, self.n_heads, self.qk_rope_dim)
+        q_nope = self.q_head_norm(q_nope)  # QK-norm on nope component
         q_rope = apply_rope(q_rope, freqs_cis)
         q = torch.cat([q_nope, q_rope], dim=-1)  # (B, T, H, nope+rope)
 
@@ -368,6 +383,7 @@ class MLAttention(nn.Module):
         kv = kv.view(B, S, self.n_heads, self.qk_nope_dim + self.v_dim)
         k_nope = kv[..., : self.qk_nope_dim]  # (B, S, H, nope)
         v = kv[..., self.qk_nope_dim :]  # (B, S, H, v_dim)
+        k_nope = self.k_head_norm(k_nope)  # QK-norm on nope component
         k = torch.cat([k_nope, k_rope], dim=-1)  # (B, S, H, nope+rope)
 
         # attention
@@ -375,12 +391,12 @@ class MLAttention(nn.Module):
         k = k.transpose(1, 2)  # (B, H, S, q_head_dim)
         v = v.transpose(1, 2)  # (B, H, S, v_dim)
 
-        scale = self.q_head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
         if mask is not None:
-            attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)  # (B, H, T, v_dim)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        elif T > 1:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -448,7 +464,7 @@ class MoEFFN(nn.Module):
         self.topk = cfg.n_experts_per_tok
 
         self.router = nn.Linear(cfg.dim, cfg.n_experts, bias=False)
-        # load-balancing bias adjusted externally during training; not a gradient param
+        # load-balancing bias; stays at zero unless the DeepSeek-V3 update loop is enabled.
         self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
 
         self.routed_experts = nn.ModuleList(
@@ -461,6 +477,34 @@ class MoEFFN(nn.Module):
             ]
         )
 
+        # Loss accumulators. RecurrentBlock calls this module n_loops times per
+        # outer forward; we accumulate the Switch-T aux loss and ST-MoE z-loss
+        # across those calls, then expose their mean via self.aux_loss / self.z_loss.
+        # OpenMythos.forward calls reset_loss_accumulators() before the Prelude
+        # so each outer forward starts fresh.
+        self.register_buffer("_aux_sum", torch.tensor(0.0), persistent=False)
+        self.register_buffer("_z_sum", torch.tensor(0.0), persistent=False)
+        self.register_buffer("_loss_count", torch.tensor(0, dtype=torch.long), persistent=False)
+        # Last-call routing cache for eval/diagnostics (topk indices).
+        # Not persisted; plain attribute so it can hold any shape.
+        self.last_topk_idx: Optional[torch.Tensor] = None
+        self.aux_loss: torch.Tensor = torch.tensor(0.0)
+        self.z_loss: torch.Tensor = torch.tensor(0.0)
+
+    def reset_loss_accumulators(self) -> None:
+        """
+        Zero the running-mean buffers. Called once per outer forward pass.
+
+        Must allocate fresh tensors rather than in-place zeroing, because the
+        previous forward's `_aux_sum = _aux_sum + step_aux` reassignment left
+        the attribute pointing at a tensor attached to a now-freed autograd
+        graph; in-place zeroing that tensor triggers a "backward through freed
+        graph" error on the next step.
+        """
+        self._aux_sum = torch.zeros_like(self._aux_sum)
+        self._z_sum = torch.zeros_like(self._z_sum)
+        self._loss_count = torch.zeros_like(self._loss_count)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -472,28 +516,56 @@ class MoEFFN(nn.Module):
         B, T, D = x.shape
         flat = x.view(B * T, D)
 
-        # router — bias shifts logits for load balancing without touching loss
-        logits = self.router(flat) + self.router_bias  # (B*T, n_experts)
+        logits = self.router(flat) + self.router_bias
         scores = F.softmax(logits, dim=-1)
         topk_scores, topk_idx = scores.topk(self.topk, dim=-1)
-        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
+        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)
 
-        # routed expert dispatch (token-level scatter)
-        out = torch.zeros_like(flat)
-        for i in range(self.topk):
-            expert_ids = topk_idx[:, i]
-            token_scores = topk_scores[:, i].unsqueeze(-1)
-            for eid in range(self.n_experts):
-                mask = expert_ids == eid
-                if not mask.any():
-                    continue
-                out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
+        # Switch-T aux: correlation between routing frequency and confidence.
+        expert_mask = F.one_hot(topk_idx, num_classes=self.n_experts).sum(dim=1)
+        f = expert_mask.float().mean(dim=0)
+        P = scores.mean(dim=0)
+        step_aux = self.n_experts * (f * P).sum()
+        # ST-MoE z-loss: keeps router logits bounded under bf16.
+        step_z = (torch.logsumexp(logits, dim=-1) ** 2).mean()
 
-        # shared experts always fire for every token
+        self._aux_sum = self._aux_sum + step_aux
+        self._z_sum = self._z_sum + step_z
+        self._loss_count = self._loss_count + 1
+        denom = self._loss_count.clamp(min=1).to(step_aux.dtype)
+        self.aux_loss = self._aux_sum / denom
+        self.z_loss = self._z_sum / denom
+        # Cache most recent topk_idx for eval/utilization analysis.
+        self.last_topk_idx = topk_idx.detach()
+
+        flat_expanded = flat.repeat_interleave(self.topk, dim=0)
+        topk_idx_flat = topk_idx.view(B * T * self.topk)
+        topk_scores_flat = topk_scores.view(B * T * self.topk)
+
+        sort_idx = topk_idx_flat.argsort()
+        flat_sorted = flat_expanded[sort_idx]
+        topk_scores_sorted = topk_scores_flat[sort_idx]
+        topk_idx_sorted = topk_idx_flat[sort_idx]
+
+        out_flat = torch.zeros(B * T, D, device=flat.device, dtype=flat.dtype)
+        start = 0
+        for eid in range(self.n_experts):
+            count = (topk_idx_sorted == eid).sum().item()
+            if count == 0:
+                continue
+            end = start + count
+            indices = sort_idx[start:end]
+            orig_pos = indices // self.topk
+            expert_tokens = flat_sorted[start:end]
+            expert_scores = topk_scores_sorted[start:end]
+            out_flat.scatter_add_(0, orig_pos.unsqueeze(-1).expand_as(expert_tokens),
+                                  expert_scores.unsqueeze(-1) * self.routed_experts[eid](expert_tokens))
+            start = end
+
         for shared in self.shared_experts:
-            out = out + shared(flat)
+            out_flat = out_flat + shared(flat)
 
-        return out.view(B, T, D)
+        return out_flat.view(B, T, D)
 
 
 # ---------------------------------------------------------------------------
@@ -572,9 +644,9 @@ class LoRAAdapter(nn.Module):
         Returns:
             Delta tensor of shape (B, T, dim) to be added to the block output
         """
-        s = self.scale(torch.tensor(loop_t, device=x.device))  # (rank,)
-        down = self.down(x) * s  # (B, T, rank)
-        return down @ self.B  # (B, T, dim)
+        s = self.scale.weight[loop_t]
+        down = self.down(x) * s
+        return down @ self.B
 
 
 # ---------------------------------------------------------------------------
@@ -788,7 +860,7 @@ class RecurrentBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run the recurrent loop for up to n_loops iterations with ACT early exit.
 
@@ -803,13 +875,16 @@ class RecurrentBlock(nn.Module):
                         each loop iteration uses a separate cache key
 
         Returns:
-            ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
+            Tuple of:
+            - ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
+            - Cumulative ponder cost (sum of halting probabilities), shape (B, T)
         """
         n_loops = n_loops or self.cfg.max_loop_iters
         B, T, D = h.shape
 
         halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
         cumulative_p = torch.zeros(B, T, device=h.device)
+        cumulative_ponder = torch.zeros(B, T, device=h.device)
         h_out = torch.zeros_like(h)
 
         for t in range(n_loops):
@@ -820,11 +895,9 @@ class RecurrentBlock(nn.Module):
             trans_out = trans_out + self.lora(trans_out, t)
             h = self.injection(h, e, trans_out)
 
-            p = self.act(h)  # (B, T)
+            p = self.act(h)
             still_running = ~halted
 
-            # ACT remainder trick: once cumulative_p + p crosses threshold,
-            # assign the remaining probability mass as the final weight
             remainder = (1.0 - cumulative_p).clamp(min=0)
             weight = torch.where(
                 cumulative_p + p >= self.cfg.act_threshold,
@@ -834,12 +907,13 @@ class RecurrentBlock(nn.Module):
             h_out = h_out + weight.unsqueeze(-1) * h
 
             cumulative_p = cumulative_p + p * still_running.float()
+            cumulative_ponder = cumulative_ponder + p * still_running.float()
             halted = halted | (cumulative_p >= self.cfg.act_threshold)
 
             if halted.all():
                 break
 
-        return h_out
+        return h_out, cumulative_ponder
 
 
 # ---------------------------------------------------------------------------
@@ -909,12 +983,78 @@ class OpenMythos(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Initialize all linear and embedding weights with N(0, 0.02)."""
+        """
+        Initialize weights with N(0, 0.02), then apply the overrides that
+        stabilize a looped/MoE model:
+
+          1. Depth-scaled residual-stream output projections (attn.wo and ffn.down)
+             scaled by 1/sqrt(2 * effective_depth). Prevents activation blowup
+             through an architecture that behaves as ~16 layers deep.
+          2. ACT halting bias biased to -2.0 so sigmoid ≈ 0.12 at init
+             (avoids collapse-at-step-1).
+          3. LTI injection parameterized so A_init ≈ 0.9 per channel at construction
+             (near-identity injection preserves >90% of hidden state per loop early
+             in training, vs the 37% that log_A = 0 would produce).
+        """
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, std=0.02)
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
+
+        # (1) Depth-scaled output projections. Assumes training_max_loops = 8
+        # (the curriculum's post-ramp target); mismatches only affect magnitudes
+        # at initialization, which the optimizer absorbs.
+        training_max_loops = 8
+        effective_depth = self.cfg.prelude_layers + training_max_loops + self.cfg.coda_layers
+        depth_scale = 1.0 / math.sqrt(2.0 * effective_depth)
+
+        def _scale_residual_outputs(block: TransformerBlock) -> None:
+            with torch.no_grad():
+                block.attn.wo.weight.mul_(depth_scale)
+                ffn = block.ffn
+                if isinstance(ffn, Expert):
+                    ffn.down.weight.mul_(depth_scale)
+                elif isinstance(ffn, MoEFFN):
+                    for expert in ffn.routed_experts:
+                        expert.down.weight.mul_(depth_scale)
+                    for expert in ffn.shared_experts:
+                        expert.down.weight.mul_(depth_scale)
+
+        for block in self.prelude:
+            _scale_residual_outputs(block)
+        _scale_residual_outputs(self.recurrent.block)
+        for block in self.coda:
+            _scale_residual_outputs(block)
+
+        # (2) ACT halt bias.
+        nn.init.constant_(self.recurrent.act.halt.bias, -2.0)
+
+        # (3) LTI injection near-identity. A = exp(-exp(log_dt + log_A));
+        # target A ≈ 0.9 → exp(log_dt + log_A) = -log(0.9) ≈ 0.1054.
+        # Pick log_dt = 0, log_A = log(-log(0.9)) ≈ -2.25.
+        with torch.no_grad():
+            self.recurrent.injection.log_A.fill_(math.log(-math.log(0.9)))
+            self.recurrent.injection.log_dt.zero_()
+
+    def muon_param_predicate(self, name: str, param: nn.Parameter) -> bool:
+        """
+        Return True if this parameter should be optimized by Muon (2D transformer
+        weight matrix), False if it should go to AdamW. Used by the training
+        harness to partition parameters into four groups (muon/adamw × default/recurrent).
+
+        Exclusions: embedding (and its tied head), RMSNorm weights, 1D LoRA scale
+        embedding, any non-2D tensor.
+        """
+        if param.ndim != 2:
+            return False
+        if "embed" in name or "head.weight" in name:
+            return False
+        if "lora.scale" in name:
+            return False
+        if ".norm" in name:  # RMSNorm weight tensors are 1D but guard anyway
+            return False
+        return True
 
     @staticmethod
     def _causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
@@ -936,7 +1076,7 @@ class OpenMythos(nn.Module):
         input_ids: torch.Tensor,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through Prelude → Recurrent Block → Coda.
 
@@ -948,10 +1088,18 @@ class OpenMythos(nn.Module):
                          pass an empty dict {} and reuse across decode steps
 
         Returns:
-            Logits of shape (B, T, vocab_size)
+            Tuple of:
+            - Logits of shape (B, T, vocab_size)
+            - Ponder cost from ACT halting, shape (B, T)
         """
         B, T = input_ids.shape
         device = input_ids.device
+
+        # Reset the MoE aux/z-loss running-mean accumulators so each outer
+        # forward starts from zero. RecurrentBlock will call MoEFFN.forward
+        # n_loops times, and the final aux_loss/z_loss will be the mean across
+        # those calls — preserving Switch-T coefficient semantics.
+        self.recurrent.block.ffn.reset_loss_accumulators()
 
         x = self.embed(input_ids)
         freqs_cis = (
@@ -962,13 +1110,13 @@ class OpenMythos(nn.Module):
         for i, layer in enumerate(self.prelude):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
 
-        e = x  # encoded input frozen for injection every loop
-        x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
+        e = x
+        x, ponder_cost = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
 
         for i, layer in enumerate(self.coda):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
 
-        return self.head(self.norm(x))
+        return self.head(self.norm(x)), ponder_cost
 
     @torch.no_grad()
     def generate(
@@ -1003,7 +1151,7 @@ class OpenMythos(nn.Module):
         kv_cache: dict = {}
         for step in range(max_new_tokens):
             cur_ids = input_ids if step == 0 else input_ids[:, -1:]
-            logits = self.forward(cur_ids, n_loops=n_loops, kv_cache=kv_cache)
+            logits, _ = self.forward(cur_ids, n_loops=n_loops, kv_cache=kv_cache)
             logits = logits[:, -1, :] / temperature
             if top_k > 0:
                 v, _ = logits.topk(top_k)

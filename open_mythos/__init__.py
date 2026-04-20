@@ -15,6 +15,7 @@ from open_mythos.main import (
     loop_index_embedding,
     precompute_rope_freqs,
 )
+from open_mythos.baseline import DenseTransformer, DenseConfig, dense_config_from_rdt
 from open_mythos.tokenizer import MythosTokenizer
 from open_mythos.variants import (
     mythos_1b,
@@ -39,6 +40,9 @@ __all__ = [
     "ACTHalting",
     "RecurrentBlock",
     "OpenMythos",
+    "DenseTransformer",
+    "DenseConfig",
+    "dense_config_from_rdt",
     "precompute_rope_freqs",
     "apply_rope",
     "loop_index_embedding",
