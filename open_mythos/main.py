@@ -73,6 +73,16 @@ class MythosConfig:
     max_output_tokens: int = 4096
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
+    # DeepSeek-V3 router-bias update: after each optimizer step, nudge the
+    # per-expert router_bias buffer toward uniform load. Enabled by default
+    # for large expert counts (n_experts >= 128) where Switch-T aux alone
+    # tends to leave tail experts dead. The update itself lives in the
+    # training harness; MoEFFN accumulates per-step expert counts that the
+    # harness reads.
+    router_bias_update: bool = True
+    # Per-step bias update rate γ. DeepSeek-V3 uses 1e-3; higher causes
+    # routing to oscillate, lower fails to prevent dead-expert spiral.
+    router_bias_update_rate: float = 1e-3
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +495,14 @@ class MoEFFN(nn.Module):
         self.register_buffer("_aux_sum", torch.tensor(0.0), persistent=False)
         self.register_buffer("_z_sum", torch.tensor(0.0), persistent=False)
         self.register_buffer("_loss_count", torch.tensor(0, dtype=torch.long), persistent=False)
+
+        # Per-optimizer-step expert count accumulator for the DeepSeek-V3
+        # router-bias update. Unlike the loss accumulators, this persists
+        # across micro-batches within a single optimizer step and is reset
+        # by the training harness AFTER applying the bias update. Saved in
+        # checkpoints so resume lands in a consistent state.
+        self.register_buffer("_step_expert_counts", torch.zeros(cfg.n_experts), persistent=True)
+
         # Last-call routing cache for eval/diagnostics (topk indices).
         # Not persisted; plain attribute so it can hold any shape.
         self.last_topk_idx: Optional[torch.Tensor] = None
@@ -504,6 +522,15 @@ class MoEFFN(nn.Module):
         self._aux_sum = torch.zeros_like(self._aux_sum)
         self._z_sum = torch.zeros_like(self._z_sum)
         self._loss_count = torch.zeros_like(self._loss_count)
+
+    def reset_step_expert_counts(self) -> None:
+        """
+        Zero the per-optimizer-step expert-count accumulator. Called by the
+        training harness AFTER applying the DeepSeek-V3 router-bias update.
+        The counts themselves are populated in-place during forward, so a
+        simple in-place zero is safe here — no autograd graph is attached.
+        """
+        self._step_expert_counts.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -537,6 +564,19 @@ class MoEFFN(nn.Module):
         self.z_loss = self._z_sum / denom
         # Cache most recent topk_idx for eval/utilization analysis.
         self.last_topk_idx = topk_idx.detach()
+
+        # Accumulate per-optimizer-step expert counts for the DeepSeek-V3
+        # router-bias update. Counted every loop iteration and every
+        # micro-batch; reset by the training harness after each step.
+        # no_grad() keeps this off the autograd graph; topk_idx has no
+        # grad anyway (it's integer), but bincount on a detached view
+        # is the defensible form.
+        with torch.no_grad():
+            counts = torch.bincount(
+                topk_idx.detach().view(-1).to(torch.long),
+                minlength=self.n_experts,
+            ).to(self._step_expert_counts.dtype)
+            self._step_expert_counts.add_(counts)
 
         flat_expanded = flat.repeat_interleave(self.topk, dim=0)
         topk_idx_flat = topk_idx.view(B * T * self.topk)

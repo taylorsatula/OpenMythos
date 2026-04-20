@@ -347,6 +347,21 @@ def train_rdt(
         adamw.step()
         sched_muon.step()
         sched_adamw.step()
+
+        # DeepSeek-V3 router-bias update: nudge per-expert router_bias toward
+        # uniform load using counts accumulated across this step's forwards.
+        # Updates operate on a non-learnable buffer, so they don't interact
+        # with Muon or AdamW state.
+        if config.router_bias_update:
+            with torch.no_grad():
+                ffn = model.recurrent.block.ffn
+                counts = ffn._step_expert_counts
+                total = counts.sum().clamp(min=1)
+                target = total / ffn.n_experts
+                imbalance = target - counts
+                ffn.router_bias.add_(config.router_bias_update_rate * torch.sign(imbalance))
+                ffn.reset_step_expert_counts()
+
         step += 1
 
         # Spectral-radius safety gate

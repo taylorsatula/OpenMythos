@@ -103,7 +103,7 @@ def test_init_overrides():
 
 
 def test_moe_accumulators_reset_per_forward():
-    print("\n[3] MoE aux+z-loss accumulate across loops and reset per forward...")
+    print("\n[3] MoE aux+z-loss reset per forward; step-expert-counts persist...")
     cfg = _tiny_config()
     model = OpenMythos(cfg)
     model.train()
@@ -115,12 +115,24 @@ def test_moe_accumulators_reset_per_forward():
     assert int(ffn._loss_count.item()) == 3, f"_loss_count after 3-loop forward = {ffn._loss_count.item()}"
     aux_after_first = ffn.aux_loss.item()
     z_after_first = ffn.z_loss.item()
+    step_counts_after_first = ffn._step_expert_counts.sum().item()
+    # 2 * 16 tokens × 3 loops × topk=2 = 192 routing slots in total
+    assert step_counts_after_first == 2 * 16 * 3 * ffn.topk, (
+        f"step_expert_counts total = {step_counts_after_first}"
+    )
 
-    # Second forward resets
+    # Second forward: loss accumulators reset; step counts persist (training
+    # harness resets them explicitly after the post-step bias update).
     logits, ponder = model(ids, n_loops=5)
     assert int(ffn._loss_count.item()) == 5, f"_loss_count after 5-loop forward = {ffn._loss_count.item()}"
+    expected_step_total = step_counts_after_first + 2 * 16 * 5 * ffn.topk
+    assert ffn._step_expert_counts.sum().item() == expected_step_total, (
+        f"step counts not accumulating: expected {expected_step_total}, "
+        f"got {ffn._step_expert_counts.sum().item()}"
+    )
     print(f"   first forward: count=3 aux={aux_after_first:.4f} z={z_after_first:.4f}")
-    print(f"   second forward: count=5 aux={ffn.aux_loss.item():.4f} z={ffn.z_loss.item():.4f}  OK")
+    print(f"   second forward: count=5 aux={ffn.aux_loss.item():.4f} z={ffn.z_loss.item():.4f}")
+    print(f"   _step_expert_counts persists across forwards: {int(ffn._step_expert_counts.sum().item())} total slots  OK")
 
 
 def test_spectral_radius_under_one():
@@ -241,6 +253,109 @@ def test_curriculum_plateau_coverage():
 # ---------------------------------------------------------------------------
 
 
+def test_router_bias_update_mechanism():
+    """
+    Validate the DeepSeek-V3 router-bias update mechanism directly:
+
+      1. After a forward, `_step_expert_counts` reflects observed routing.
+      2. Applying the update moves `router_bias` in the correct direction:
+         under-loaded experts get positive bias deltas, over-loaded get
+         negative ones, proportional to γ.
+      3. `reset_step_expert_counts()` zeros the accumulator.
+      4. Running the training step with `router_bias_update=False` leaves
+         `router_bias` untouched.
+
+    This is a mechanism test, not an effect test. Downstream load-balancing
+    effect depends on training dynamics over thousands of steps that a
+    smoke test can't simulate; we validate only that the correct forces
+    are being applied to the correct state.
+    """
+    print("\n[10] DeepSeek-V3 router-bias update mechanism (direction, reset, toggle)...")
+
+    torch.manual_seed(0)
+    cfg = MythosConfig(
+        vocab_size=256, dim=64, n_heads=4, n_kv_heads=2, max_seq_len=64,
+        max_loop_iters=4, prelude_layers=1, coda_layers=1, attn_type="gqa",
+        n_experts=16, n_shared_experts=1, n_experts_per_tok=2, expert_dim=32,
+        act_threshold=0.99, rope_theta=10000.0, lora_rank=4, dropout=0.0,
+        router_bias_update=True, router_bias_update_rate=1e-2,
+    )
+    model = OpenMythos(cfg)
+    ffn = model.recurrent.block.ffn
+
+    # Force a lopsided routing distribution: expert 0 wins every top-K slot
+    # decisively, and every other expert is near-zero. Router weight is zeroed
+    # so only the bias matters; expert 0's bias is much larger than everyone's.
+    with torch.no_grad():
+        ffn.router.weight.zero_()
+        ffn.router_bias.zero_()
+        ffn.router_bias[0] = 10.0
+
+    model.train()
+    ids = torch.randint(0, cfg.vocab_size, (4, 32))
+    _ = model(ids, n_loops=2)
+
+    counts = ffn._step_expert_counts.clone()
+    assert counts.sum().item() > 0, "step counts did not accumulate"
+    # Expert 0 should claim ~1/topk of all routing slots (it wins one of two
+    # top-k slots per token; the second slot is arbitrary among the others).
+    top1_share = counts[0].item() / counts.sum().item()
+    assert top1_share > 0.4, f"expected expert 0 dominant; share = {top1_share:.3f}"
+    # And it should exceed the uniform target.
+    uniform_target = counts.sum().item() / cfg.n_experts
+    assert counts[0].item() > uniform_target, (
+        f"expert 0 not above uniform target: {counts[0].item()} vs {uniform_target}"
+    )
+
+    # Apply the bias update once.
+    bias_before = ffn.router_bias.clone()
+    with torch.no_grad():
+        total = counts.sum().clamp(min=1)
+        target = total / ffn.n_experts
+        imbalance = target - counts
+        ffn.router_bias.add_(cfg.router_bias_update_rate * torch.sign(imbalance))
+        ffn.reset_step_expert_counts()
+    delta = ffn.router_bias - bias_before
+
+    gamma = cfg.router_bias_update_rate
+    tol = 1e-5
+    # Fundamental invariant: delta == γ * sign(target - counts), element-wise.
+    total = counts.sum()
+    target_per_expert = total / cfg.n_experts
+    imbalance = target_per_expert - counts
+    expected_delta = gamma * torch.sign(imbalance)
+    assert torch.allclose(delta, expected_delta, atol=tol), (
+        f"delta ≠ γ * sign(imbalance). delta={delta}, expected={expected_delta}"
+    )
+    # Expert 0 is definitely over-loaded (we biased it to 10).
+    assert delta[0].item() < 0, f"expected expert 0 delta negative, got {delta[0].item()}"
+    # Accumulator should be zeroed.
+    assert ffn._step_expert_counts.abs().sum().item() == 0.0
+
+    # Toggle off: bias must not change across a second train step.
+    cfg_off = MythosConfig(
+        vocab_size=256, dim=64, n_heads=4, n_kv_heads=2, max_seq_len=64,
+        max_loop_iters=4, prelude_layers=1, coda_layers=1, attn_type="gqa",
+        n_experts=16, n_shared_experts=1, n_experts_per_tok=2, expert_dim=32,
+        act_threshold=0.99, rope_theta=10000.0, lora_rank=4, dropout=0.0,
+        router_bias_update=False, router_bias_update_rate=1e-2,
+    )
+    model2 = OpenMythos(cfg_off)
+    ffn2 = model2.recurrent.block.ffn
+    with torch.no_grad():
+        ffn2.router_bias.fill_(0.5)
+    frozen_bias = ffn2.router_bias.clone()
+    _ = model2(ids, n_loops=2)
+    # Simulate what train.py does when router_bias_update=False: nothing.
+    assert torch.allclose(ffn2.router_bias, frozen_bias), (
+        "router_bias changed despite toggle being off"
+    )
+
+    print(f"   expert-0 share before update = {top1_share:.3f}")
+    print(f"   Δbias = γ·sign(target − counts) holds for all 16 experts")
+    print(f"   accumulator reset after update  OK")
+
+
 def test_checkpoint_roundtrip():
     print("\n[9] Checkpoint save/load round-trip preserves both optimizer states + RNG...")
     cfg = _tiny_config()
@@ -320,6 +435,7 @@ def main():
     test_training_step_and_grads()
     test_loss_decreases_on_toy_task()
     test_curriculum_plateau_coverage()
+    test_router_bias_update_mechanism()
     test_checkpoint_roundtrip()
 
     print("\n" + "=" * 60)

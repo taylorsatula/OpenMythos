@@ -338,7 +338,7 @@ After `OpenMythos._init_weights()` runs the default N(0, 0.02) init, apply these
 
 3. **LTI injection near-identity**: initialize `LTIInjection.log_A` such that `A_init ≈ 0.9` per channel (i.e., `log_A = log(-log(0.9)) ≈ -2.25`); `log_dt = 0`. Keeps >90% of hidden state across early loops before the transformer contribution is meaningful, rather than the 37% the zero-init produces.
 
-4. **Router bias**: leaves at zeros (initialized by `register_buffer`). If the DeepSeek-V3 update from §11 is enabled, this buffer is updated post-step; otherwise it remains at zero and only the aux + z-loss enforce balance.
+4. **Router bias**: initialized at zero (`register_buffer`). The DeepSeek-V3 bias update from §3.11 is **enabled by default** (`cfg.router_bias_update=True`); after each optimizer step it nudges the buffer toward uniform load.
 
 ### 3.10 Training Stability & Throughput Defaults
 
@@ -346,6 +346,29 @@ After `OpenMythos._init_weights()` runs the default N(0, 0.02) init, apply these
 - **`torch.compile` on Prelude and Coda**: wrap each of `self.prelude` and `self.coda` (as `nn.Sequential` or individually) with `torch.compile(mode="reduce-overhead")`. Do NOT compile the recurrent block — dynamic `n_loops` and the Python-level MoE dispatch trigger recompiles or fallbacks. Expected: 20–30% throughput gain on those portions.
 - **`set_to_none=True` on zero_grad**: skips the zeroing kernel.
 - **Pinned memory + `non_blocking=True`** on host→device transfers in the dataloader. Already standard for the DataLoader's `pin_memory=True`.
+
+### 3.11 DeepSeek-V3 Router Bias Update (on by default)
+
+At `n_experts=192` the Switch-T aux loss alone tends to leave tail experts dead during early training. Augment it with the DeepSeek-V3 bias-update scheme:
+
+```python
+# After muon.step() + adamw.step() but before step += 1:
+if cfg.router_bias_update:
+    with torch.no_grad():
+        ffn = model.recurrent.block.ffn
+        counts = ffn._step_expert_counts          # accumulated across this step's forwards
+        target = counts.sum() / ffn.n_experts
+        imbalance = target - counts
+        ffn.router_bias.add_(cfg.router_bias_update_rate * torch.sign(imbalance))
+        ffn.reset_step_expert_counts()
+```
+
+Notes:
+
+- **Non-learned.** `router_bias` is a buffer; no gradient flows through it and it does not interact with Muon's Newton-Schulz geometry. It rides on top of the gradient-driven `router.weight` (which Muon does optimize).
+- **Per-expert count accumulator.** `MoEFFN._step_expert_counts` is a persistent buffer; it is populated inside `MoEFFN.forward` and spans both micro-batches and loop iterations within a single optimizer step. The training harness calls `reset_step_expert_counts()` after applying the update. Saved in checkpoints so resume is deterministic.
+- **γ choice.** `cfg.router_bias_update_rate=1e-3` is the DeepSeek-V3 paper default. Higher values cause routing oscillation; lower fails to prevent dead-expert spiral under adversarial routing. Monitor `train/moe_dead_expert_count`.
+- **Toggle.** Setting `cfg.router_bias_update=False` disables the update; the buffer still exists and is still added to router logits (at zeros), but nothing modifies it. Use as a debugging knob if routing appears to oscillate.
 
 ---
 

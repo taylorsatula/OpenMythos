@@ -27,6 +27,7 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the upstream README with the full h
 
 **Architectural additions to `open_mythos/main.py`**
 - **MoE aux + z-loss accumulators** with a `reset_loss_accumulators()` hook called at the top of every `OpenMythos.forward`. Previously `aux_loss` was overwritten every loop iteration, so T−1 loops worth of routing signal was discarded. Now the optimizer sees the mean across all loop iterations; Switch-T coefficient semantics preserved.
+- **DeepSeek-V3 router-bias update** (on by default at `n_experts=192`). `MoEFFN._step_expert_counts` accumulates per-expert routing counts across all micro-batches and loop iterations in an optimizer step; the training harness nudges `router_bias` by `γ · sign(target_load − observed_load)` after `optimizer.step()` and resets. Hard load-balance force complementary to the soft aux loss; avoids dead-expert spiral during early training. γ=1e-3 default; toggleable via `cfg.router_bias_update`.
 - **ST-MoE z-loss** — `logsumexp(router_logits)² mean` with coefficient 1e-3. Keeps router logits bounded under bf16.
 - **QK-norm** (DeepSeek-V3 / Gemma-2 style) on both GQA and MLA. Bounds attention logits across the looped recurrent block where the same attention runs T times.
 - **Depth-scaled output projections** at init: `attn.wo` and `ffn.down` multiplied by `1/sqrt(2 · effective_depth) ≈ 0.177` (effective_depth = prelude + max_loops_train + coda = 16). Standard GPT-2 trick adapted for the effective depth of a looped model.
@@ -114,7 +115,6 @@ bash scripts/run_training.sh rdt --resume outputs/rdt_1.5b/checkpoints/checkpoin
 ## What is *not* yet done
 
 - **No full training run has happened.** The code has not been exercised against the 15B-token FineWeb-Edu+code+math mix on H200 (or any other production setting). Expect some combination of: Parquet shard schema mismatches the first time `prepare_data.py` is run at scale, `torch.compile` recompile storms on sequence-length variations, MoE routing collapse under Muon that the smoke test can't surface at tiny scale, off-by-one in `next()` iteration handling when the data stream rolls over, numerical surprises in the Newton-Schulz iteration at bf16 boundaries, and/or activation-memory regressions from `torch.compile`'s chosen graph. The smoke test validates the *plumbing*; it cannot validate training dynamics.
-- The [DeepSeek-V3 router bias update](https://arxiv.org/abs/2412.19437) is wired into the model (the `router_bias` buffer is added to logits) but the post-step update loop is **not implemented**. Add it if expert-utilization collapse appears during real training.
 - Document-boundary attention masking via FlexAttention — deferred.
 - FP8 training via Transformer Engine — deferred.
 - Distributed Muon — single-GPU only for now.
