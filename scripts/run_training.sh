@@ -2,12 +2,13 @@
 # Training launch script for OpenMythos.
 #
 # Usage:
-#   ./scripts/run_training.sh [rdt|baseline] [extra args]
+#   ./scripts/run_training.sh [rdt|baseline|tiny] [extra args]
 #
 # Examples:
 #   ./scripts/run_training.sh rdt
 #   ./scripts/run_training.sh rdt --resume outputs/rdt_1.5b/checkpoints/checkpoint_step_5000.pt
 #   ./scripts/run_training.sh baseline
+#   ./scripts/run_training.sh tiny           # ~15-min end-to-end pipeline sanity run
 
 set -e
 
@@ -52,6 +53,25 @@ if [ "$MODEL_TYPE" = "rdt" ]; then
         --eval_interval 500 \
         --checkpoint_interval 2500 \
         "${@:2}"
+elif [ "$MODEL_TYPE" = "tiny" ]; then
+    echo "Starting tiny RDT sanity run (~15 min target)..."
+    python -m training.train \
+        --model rdt \
+        --config tiny_rdt \
+        --output_dir "outputs" \
+        --data_dir "data/tokenized_shards" \
+        --total_steps 50 \
+        --warmup_steps 5 \
+        --micro_batch 2 \
+        --grad_accum 2 \
+        --max_seq_len 2048 \
+        --max_loops 2 \
+        --lr_muon 0.02 \
+        --lr_adamw 3e-4 \
+        --eval_interval 25 \
+        --checkpoint_interval 25 \
+        --no_compile \
+        "${@:2}"
 elif [ "$MODEL_TYPE" = "baseline" ]; then
     echo "Starting dense baseline training..."
     python -m training.train \
@@ -70,7 +90,7 @@ elif [ "$MODEL_TYPE" = "baseline" ]; then
         "${@:2}"
 else
     echo "Unknown model type: $MODEL_TYPE"
-    echo "Usage: ./scripts/run_training.sh [rdt|baseline]"
+    echo "Usage: ./scripts/run_training.sh [rdt|baseline|tiny]"
     exit 1
 fi
 

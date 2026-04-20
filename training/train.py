@@ -786,6 +786,8 @@ def train_dense_baseline(
 def main():
     parser = argparse.ArgumentParser(description="Train OpenMythos RDT or dense baseline")
     parser.add_argument("--model", choices=["rdt", "dense"], default="rdt")
+    parser.add_argument("--config", choices=["rdt_1_5b", "tiny_rdt"], default="rdt_1_5b",
+                        help="RDT config variant. Ignored when --model=dense.")
     parser.add_argument("--output_dir", type=str, default="outputs")
     parser.add_argument("--data_dir", type=str, default="data/tokenized_shards")
     parser.add_argument("--total_steps", type=int, default=29000)
@@ -806,10 +808,15 @@ def main():
     use_compile = not args.no_compile
 
     if args.model == "rdt":
-        from configs.rdt_1_5b import RDT_1_5B_CONFIG
+        if args.config == "tiny_rdt":
+            from configs.tiny_rdt import TINY_RDT_CONFIG as RDT_CONFIG
+            rdt_subdir = "tiny_rdt"
+        else:
+            from configs.rdt_1_5b import RDT_1_5B_CONFIG as RDT_CONFIG
+            rdt_subdir = "rdt_1.5b"
         train_rdt(
-            RDT_1_5B_CONFIG,
-            output_dir=f"{args.output_dir}/rdt_1.5b",
+            RDT_CONFIG,
+            output_dir=f"{args.output_dir}/{rdt_subdir}",
             data_dir=args.data_dir,
             total_steps=args.total_steps,
             warmup_steps=args.warmup_steps,
